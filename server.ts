@@ -17,20 +17,46 @@ body{font-family:system-ui,sans-serif;max-width:52rem;margin:3rem auto;padding:0
 a{color:#175b9c}
 h2{margin-top:2rem}
 form{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;margin:1rem 0 1.5rem}
+form.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.15)}
 label{display:block;font-weight:600;margin:.9rem 0 .3rem}
 input[type=text],textarea{width:100%;box-sizing:border-box;font:inherit;padding:.5rem .6rem;border:1px solid #d0d7de;border-radius:6px;background:#fff;color:inherit}
 textarea{resize:vertical}
 button{margin-top:1.1rem;font:inherit;padding:.5rem 1.3rem;border-radius:6px;border:1px solid #175b9c;background:#175b9c;color:#fff;cursor:pointer}
+button.secondary{background:#fff;color:#175b9c;margin-left:.6rem}
 button:disabled{opacity:.55;cursor:default}
+button.danger{border-color:#c0392b;background:#fff;color:#c0392b}
 .status{margin:.8rem 0 0;min-height:1.4em}
 .status.ok{color:#1a7f37}.status.err{color:#c0392b}
+.edit-banner{margin:0 0 .25rem;padding:.6rem .8rem;border-radius:6px;background:#eef4fb;border:1px solid #b6d2ee;color:#14467a;font-size:.92rem}
+.edit-banner code{background:#dde9f6;padding:0 .3rem;border-radius:3px}
+.edit-banner .meta{color:#3d6391;font-size:.85rem;margin-top:.2rem}
 ul.articles{list-style:none;padding:0;margin:0}
 article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;margin:1rem 0}
+article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.15)}
 .draft h3{margin:0 0 .4rem;word-break:break-word}
 .draft .meta{color:#656d76;font-size:.85rem;margin:0 0 .5rem}
-.draft .summary{white-space:pre-wrap;word-break:break-word;margin:0;color:#3a4149}
+.draft .summary{white-space:pre-wrap;word-break:break-word;margin:0 0 .4rem;color:#3a4149}
+.draft .actions{margin:.6rem 0 0}
+.draft .actions button{margin:0;padding:.3rem .9rem;font-size:.88rem}
+.draft .editing-tag{margin-left:.5rem;font-size:.78rem;font-weight:600;color:#175b9c;border:1px solid #175b9c;border-radius:999px;padding:0 .55rem;vertical-align:middle}
 .empty{color:#656d76}
 .empty.err{color:#c0392b}
+.conflict{margin-top:1rem;border:1px solid #d9a441;border-radius:8px;background:#fffaf0;padding:1rem 1.25rem}
+.conflict h3{margin:0 0 .3rem;color:#8a5a00;font-size:1.05rem}
+.conflict .conflict-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:.7rem}
+@media (max-width:46rem){.conflict .conflict-grid{grid-template-columns:1fr}}
+.conflict .ver{border:1px solid #d0d7de;border-radius:6px;padding:.7rem .85rem;background:#fff;min-width:0}
+.conflict .ver.saved{border-color:#8ab46a;background:#f6fbf2}
+.conflict .ver h4{margin:0 0 .5rem;font-size:.92rem}
+.conflict .ver dl{margin:0}
+.conflict .ver dt{font-weight:600;font-size:.82rem;color:#57606a;margin-top:.5rem}
+.conflict .ver dt:first-child{margin-top:0}
+.conflict .ver dd{margin:.15rem 0 0;white-space:pre-wrap;word-break:break-word;font-size:.88rem;background:#f6f8fa;border-radius:4px;padding:.35rem .5rem;max-height:12rem;overflow:auto}
+.conflict .ver.saved dd{background:#eef5e8}
+.conflict .ver dd.empty-field{color:#8a8f98;font-style:italic;background:transparent;padding:0}
+.conflict .actions{margin-top:.8rem}
+.conflict .actions button{margin-top:0}
+.conflict .actions .tip{font-size:.82rem;color:#8a5a00;margin-left:.6rem}
 </style>
 <main>
 <h1>QuillPress</h1>
@@ -39,6 +65,7 @@ article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;ma
 <section aria-labelledby="compose-heading">
 <h2 id="compose-heading">保存草稿</h2>
 <form id="draft-form" autocomplete="off">
+  <div id="edit-banner" class="edit-banner" hidden></div>
   <label for="title">标题</label>
   <input id="title" name="title" type="text">
   <label for="summary">摘要（可选）</label>
@@ -46,7 +73,9 @@ article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;ma
   <label for="body">正文</label>
   <textarea id="body" name="body" rows="10"></textarea>
   <button id="save-btn" type="submit">保存草稿</button>
+  <button id="cancel-btn" class="secondary" type="button" hidden>取消编辑</button>
   <p id="status" class="status" role="status" aria-live="polite"></p>
+  <div id="conflict-box" class="conflict" hidden></div>
 </form>
 </section>
 
@@ -66,11 +95,16 @@ article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;ma
   var summaryInput = document.getElementById('summary');
   var bodyInput = document.getElementById('body');
   var saveBtn = document.getElementById('save-btn');
+  var cancelBtn = document.getElementById('cancel-btn');
   var statusEl = document.getElementById('status');
+  var editBanner = document.getElementById('edit-banner');
+  var conflictBox = document.getElementById('conflict-box');
   var listEl = document.getElementById('article-list');
   var emptyTip = document.getElementById('empty-tip');
   var articles = [];
   var saving = false;
+  // null = 新建草稿模式；对象 = 正在编辑的服务端版本 {id,title,summary,body,version}
+  var editing = null;
 
   function setStatus(text, kind) {
     statusEl.textContent = text || '';
@@ -80,6 +114,10 @@ article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;ma
     emptyTip.textContent = text || '';
     emptyTip.className = 'empty' + (kind ? ' ' + kind : '');
     emptyTip.hidden = !text;
+  }
+  function hideConflict() {
+    conflictBox.hidden = true;
+    conflictBox.textContent = '';
   }
   function formatTime(iso) {
     var d = new Date(iso);
@@ -94,19 +132,37 @@ article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;ma
     });
     listEl.textContent = '';
     sorted.forEach(function (article) {
+      var isEditing = editing && editing.id === article.id;
       var card = document.createElement('article');
-      card.className = 'draft';
+      card.className = 'draft' + (isEditing ? ' editing' : '');
       var h = document.createElement('h3');
       h.textContent = article.title == null ? '' : String(article.title);
+      if (isEditing) {
+        var tag = document.createElement('span');
+        tag.className = 'editing-tag';
+        tag.textContent = '编辑中';
+        h.appendChild(tag);
+      }
       var meta = document.createElement('p');
       meta.className = 'meta';
       meta.textContent = '创建时间：' + formatTime(article.createdAt);
       var summary = document.createElement('p');
       summary.className = 'summary';
-      summary.textContent = article.summary == null ? '' : String(article.summary);
+      var summaryText = article.summary == null ? '' : String(article.summary);
+      summary.textContent = summaryText;
       card.appendChild(h);
       card.appendChild(meta);
-      card.appendChild(summary);
+      if (summaryText) card.appendChild(summary);
+      var actions = document.createElement('p');
+      actions.className = 'actions';
+      var editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'secondary';
+      editBtn.textContent = isEditing ? '正在编辑' : '编辑';
+      editBtn.disabled = !!isEditing;
+      editBtn.addEventListener('click', function () { startEdit(article.id); });
+      actions.appendChild(editBtn);
+      card.appendChild(actions);
       var li = document.createElement('li');
       li.appendChild(card);
       listEl.appendChild(li);
@@ -114,7 +170,7 @@ article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;ma
     setEmpty(sorted.length === 0 ? '还没有保存的草稿。' : '');
   }
   function load() {
-    fetch('/api/articles', { headers: { accept: 'application/json' } })
+    return fetch('/api/articles', { headers: { accept: 'application/json' } })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
@@ -130,10 +186,190 @@ article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;ma
       });
   }
 
-  function setSaving(on) {
+  function setSaving(on, label) {
     saving = on;
     saveBtn.disabled = on;
-    saveBtn.textContent = on ? '保存中…' : '保存草稿';
+    saveBtn.textContent = label || (editing ? '保存修改' : '保存草稿');
+    cancelBtn.disabled = on;
+  }
+
+  function enterCreateMode(message, kind) {
+    editing = null;
+    form.reset();
+    form.classList.remove('editing');
+    editBanner.hidden = true;
+    editBanner.textContent = '';
+    hideConflict();
+    cancelBtn.hidden = true;
+    saveBtn.textContent = '保存草稿';
+    setStatus(message || '', kind || '');
+    render();
+  }
+
+  function applyEditingState(article) {
+    editing = {
+      id: article.id,
+      title: article.title,
+      summary: article.summary,
+      body: article.body,
+      version: article.version
+    };
+    titleInput.value = article.title == null ? '' : String(article.title);
+    summaryInput.value = article.summary == null ? '' : String(article.summary);
+    bodyInput.value = article.body == null ? '' : String(article.body);
+    form.classList.add('editing');
+    editBanner.innerHTML = '';
+    var line1 = document.createElement('div');
+    line1.textContent = '正在编辑草稿：';
+    var code = document.createElement('code');
+    code.textContent = String(article.title);
+    line1.appendChild(code);
+    var line2 = document.createElement('div');
+    line2.className = 'meta';
+    line2.textContent = '创建时间：' + formatTime(article.createdAt) + ' · 标识：' + String(article.id);
+    editBanner.appendChild(line1);
+    editBanner.appendChild(line2);
+    editBanner.hidden = false;
+    cancelBtn.hidden = false;
+    saveBtn.textContent = '保存修改';
+    hideConflict();
+    setStatus('已载入该草稿当前保存的内容，可以开始修改。', null);
+    render();
+    titleInput.focus();
+  }
+
+  function isDirty() {
+    if (!editing) {
+      return titleInput.value !== '' || summaryInput.value !== '' || bodyInput.value !== '';
+    }
+    return titleInput.value !== editing.title
+      || summaryInput.value !== editing.summary
+      || bodyInput.value !== editing.body;
+  }
+
+  function startEdit(id) {
+    if (saving) return;
+    if (isDirty() && !window.confirm('当前表单有未保存的修改，打开另一篇草稿将放弃这些输入。确定继续吗？')) {
+      return;
+    }
+    setSaving(true, '读取中…');
+    setStatus('正在读取草稿内容…', null);
+    fetch('/api/articles/' + encodeURIComponent(id), { headers: { accept: 'application/json' } })
+      .then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (data) {
+          if (!r.ok || !data || !data.article) {
+            throw new Error(data && data.error ? data.error : ('HTTP ' + r.status));
+          }
+          return data.article;
+        });
+      })
+      .then(function (article) {
+        setSaving(false);
+        // 正文必须来自单篇接口，绝不使用列表里的摘要充当正文
+        applyEditingState(article);
+      })
+      .catch(function (err) {
+        setSaving(false);
+        saveBtn.textContent = editing ? '保存修改' : '保存草稿';
+        setStatus('打开草稿失败：' + (err && err.message ? err.message : err) + '，可稍后重试。', 'err');
+      });
+  }
+
+  cancelBtn.addEventListener('click', function () {
+    if (saving || !editing) return;
+    // 取消不提交任何修改，也不删除原文章，直接回到新建草稿状态
+    if (isDirty() && !window.confirm('取消将放弃当前未保存的修改，原草稿不会被删除。确定取消编辑吗？')) {
+      return;
+    }
+    enterCreateMode('已取消编辑，原草稿未改动。可以新建草稿。', null);
+  });
+
+  function fieldValue(text, isEmpty) {
+    var dd = document.createElement('dd');
+    if (isEmpty) {
+      dd.className = 'empty-field';
+      dd.textContent = '（空）';
+    } else {
+      dd.textContent = text;
+    }
+    return dd;
+  }
+
+  function showConflict(saved) {
+    // 只展示对照，绝不重置表单、绝不自动重试覆盖
+    conflictBox.textContent = '';
+    var h = document.createElement('h3');
+    h.textContent = '检测到较新的已保存内容';
+    var p = document.createElement('p');
+    p.textContent = '这篇草稿在其他页面已被修改并保存。为避免覆盖新版本，本次保存已被拒绝。你输入的内容仍保留在上方表单中，可对照右侧最新版本；只有明确放弃当前输入后，才会载入最新内容继续编辑。';
+    conflictBox.appendChild(h);
+    conflictBox.appendChild(p);
+
+    var grid = document.createElement('div');
+    grid.className = 'conflict-grid';
+
+    var mine = document.createElement('div');
+    mine.className = 'ver mine';
+    var mineTitle = document.createElement('h4');
+    mineTitle.textContent = '你正在编辑的内容（未保存）';
+    mine.appendChild(mineTitle);
+    var dl1 = document.createElement('dl');
+    [['标题', titleInput.value, titleInput.value.trim() === ''],
+     ['摘要', summaryInput.value, summaryInput.value === ''],
+     ['正文', bodyInput.value, bodyInput.value === '']].forEach(function (pair) {
+      var dt = document.createElement('dt');
+      dt.textContent = pair[0];
+      dl1.appendChild(dt);
+      dl1.appendChild(fieldValue(pair[1], pair[2]));
+    });
+    mine.appendChild(dl1);
+
+    var theirs = document.createElement('div');
+    theirs.className = 'ver saved';
+    var tTitle = document.createElement('h4');
+    tTitle.textContent = '最新已保存内容';
+    theirs.appendChild(tTitle);
+    var dl2 = document.createElement('dl');
+    [['标题', saved.title, saved.title === ''],
+     ['摘要', saved.summary, saved.summary === ''],
+     ['正文', saved.body, saved.body === '']].forEach(function (pair) {
+      var dt = document.createElement('dt');
+      dt.textContent = pair[0];
+      dl2.appendChild(dt);
+      dl2.appendChild(fieldValue(pair[1], pair[2]));
+    });
+    theirs.appendChild(dl2);
+
+    grid.appendChild(mine);
+    grid.appendChild(theirs);
+    conflictBox.appendChild(grid);
+
+    var actions = document.createElement('p');
+    actions.className = 'actions';
+    var discard = document.createElement('button');
+    discard.type = 'button';
+    discard.className = 'danger';
+    discard.textContent = '放弃当前输入并载入最新内容';
+    discard.addEventListener('click', function () {
+      applyEditingState(saved);
+    });
+    var keep = document.createElement('button');
+    keep.type = 'button';
+    keep.className = 'secondary';
+    keep.textContent = '保留我的输入，继续修改';
+    keep.addEventListener('click', function () {
+      hideConflict();
+      setStatus('已保留你的输入，请对照后手动调整再保存。', null);
+      titleInput.focus();
+    });
+    var tip = document.createElement('span');
+    tip.className = 'tip';
+    tip.textContent = '不会自动覆盖或重置。';
+    actions.appendChild(discard);
+    actions.appendChild(keep);
+    actions.appendChild(tip);
+    conflictBox.appendChild(actions);
+    conflictBox.hidden = false;
   }
 
   form.addEventListener('submit', function (event) {
@@ -145,37 +381,96 @@ article.draft{border:1px solid #d0d7de;border-radius:8px;padding:1rem 1.25rem;ma
       titleInput.focus();
       return;
     }
-    setSaving(true);
-    setStatus('正在保存…', null);
-    fetch('/api/articles', {
-      method: 'POST',
+    hideConflict();
+    var isEdit = !!editing;
+    var payload = {
+      title: titleInput.value,
+      summary: summaryInput.value,
+      body: bodyInput.value
+    };
+    var url = '/api/articles';
+    if (isEdit) {
+      url += '/' + encodeURIComponent(editing.id);
+      payload.version = editing.version;
+    }
+    setSaving(true, '保存中…');
+    setStatus(isEdit ? '正在保存修改…' : '正在保存…', null);
+    fetch(url, {
+      method: isEdit ? 'PUT' : 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({
-        title: titleInput.value,
-        summary: summaryInput.value,
-        body: bodyInput.value
-      })
+      body: JSON.stringify(payload)
     })
       .then(function (r) {
         return r.json().catch(function () { return null; }).then(function (data) {
-          if (!r.ok || !data || !data.article) {
-            throw new Error(data && data.error ? data.error : ('HTTP ' + r.status));
-          }
-          return data.article;
+          return { status: r.status, data: data };
         });
       })
+      .then(function (result) {
+        var data = result.data;
+        if (result.status === 409 && data && data.article) {
+          // 版本冲突：保留表单全部输入，展示最新已保存内容供对照。
+          // 绝不更新本地基准版本——只有用户显式确认载入最新内容后才允许覆盖。
+          setSaving(false);
+          saveBtn.textContent = editing ? '保存修改' : '保存草稿';
+          setStatus('保存被拒绝：存在较新的已保存版本（409）。请对照后选择保留输入或载入最新内容。', 'err');
+          showConflict(data.article);
+          return;
+        }
+        if (result.status < 200 || result.status >= 300 || !data || !data.article) {
+          throw new Error(data && data.error ? data.error : ('HTTP ' + result.status));
+        }
+        return data.article;
+      })
       .then(function (article) {
-        articles.push(article);
-        render();
-        form.reset();
-        setStatus('草稿已保存', 'ok');
-        setSaving(false);
+        if (!article) return; // 冲突分支已处理
+        if (isEdit) {
+          var idx = -1;
+          for (var i = 0; i < articles.length; i++) {
+            if (articles[i] && articles[i].id === article.id) { idx = i; break; }
+          }
+          if (idx >= 0) articles[idx] = article; else articles.push(article);
+          render();
+          setSaving(false);
+          // 保持编辑态：仍是同一篇草稿，可继续修改
+          applyEditingStateSilent(article, '修改已保存。文章标识、创建时间与草稿状态均未改变。');
+        } else {
+          articles.push(article);
+          render();
+          setSaving(false);
+          enterCreateMode('草稿已保存。可以继续新建草稿。', 'ok');
+        }
       })
       .catch(function (err) {
-        setStatus('保存失败：' + (err && err.message ? err.message : err) + '，可修改后再次保存。', 'err');
         setSaving(false);
+        saveBtn.textContent = editing ? '保存修改' : '保存草稿';
+        var prefix = isEdit ? '保存修改失败：' : '保存失败：';
+        setStatus(prefix + (err && err.message ? err.message : err) + '，输入已保留，可处理后再次操作。', 'err');
       });
   });
+
+  // 保存成功后留在编辑态：表单同步为服务端保存的规范内容（标题已去首尾空白），
+  // 本地基准版本一并更新，不清空输入。
+  function applyEditingStateSilent(article, message) {
+    titleInput.value = article.title == null ? '' : String(article.title);
+    summaryInput.value = article.summary == null ? '' : String(article.summary);
+    bodyInput.value = article.body == null ? '' : String(article.body);
+    editing = {
+      id: article.id,
+      title: article.title,
+      summary: article.summary,
+      body: article.body,
+      version: article.version
+    };
+    form.classList.add('editing');
+    var code = editBanner.querySelector('code');
+    if (code) code.textContent = String(article.title);
+    editBanner.hidden = false;
+    cancelBtn.hidden = false;
+    saveBtn.textContent = '保存修改';
+    hideConflict();
+    setStatus(message, 'ok');
+    render();
+  }
 
   load();
 })();
@@ -221,6 +516,16 @@ interface Article {
   body: string;
   status: 'draft';
   createdAt: string;
+  version: number;
+}
+interface StoredArticle {
+  id?: unknown;
+  title?: unknown;
+  summary?: unknown;
+  body?: unknown;
+  status?: unknown;
+  createdAt?: unknown;
+  version?: unknown;
 }
 interface DraftInput {
   title: string;
@@ -256,7 +561,26 @@ function methodNotAllowed(res: ServerResponse, allow: string): void {
   res.end(body);
 }
 
-function readArticles(): unknown[] {
+// Normalize a stored record. Drafts saved by older versions have no `version`
+// field; those are treated as version 0 and can be opened and edited directly.
+function normalizeArticle(record: unknown): Article | null {
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) return null;
+  const r = record as StoredArticle;
+  if (typeof r.id !== 'string' || typeof r.title !== 'string' || typeof r.body !== 'string') return null;
+  if (r.status !== 'draft' || typeof r.createdAt !== 'string') return null;
+  const version = typeof r.version === 'number' && Number.isInteger(r.version) && r.version >= 0 ? r.version : 0;
+  return {
+    id: r.id,
+    title: r.title,
+    summary: typeof r.summary === 'string' ? r.summary : '',
+    body: r.body,
+    status: 'draft',
+    createdAt: r.createdAt,
+    version,
+  };
+}
+
+function readArticles(): Article[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(dataFile, 'utf8'));
@@ -264,24 +588,29 @@ function readArticles(): unknown[] {
     throw new Error(`unable to read articles: ${(error as Error).message}`);
   }
   if (!Array.isArray(parsed)) throw new Error('unable to read articles: stored data is not a list');
-  return parsed;
+  const articles: Article[] = [];
+  for (const record of parsed) {
+    const article = normalizeArticle(record);
+    if (article) articles.push(article);
+  }
+  return articles;
+}
+
+function writeArticles(records: Article[]): void {
+  const tmpFile = join(dataDir, `.articles.${process.pid}.tmp`);
+  try {
+    writeFileSync(tmpFile, `${JSON.stringify(records, null, 2)}\n`);
+    renameSync(tmpFile, dataFile);
+  } catch (error) {
+    try { rmSync(tmpFile, { force: true }); } catch { /* best effort cleanup */ }
+    throw new Error(`unable to save articles: ${(error as Error).message}`);
+  }
 }
 
 // Serialize read-modify-write so concurrent saves never lose or corrupt records.
 let writeQueue: Promise<void> = Promise.resolve();
-function saveArticle(article: Article): Promise<void> {
-  const run = writeQueue.then((): void => {
-    const records = readArticles();
-    records.push(article);
-    const tmpFile = join(dataDir, `.articles.${process.pid}.tmp`);
-    try {
-      writeFileSync(tmpFile, `${JSON.stringify(records, null, 2)}\n`);
-      renameSync(tmpFile, dataFile);
-    } catch (error) {
-      try { rmSync(tmpFile, { force: true }); } catch { /* best effort cleanup */ }
-      throw new Error(`unable to save articles: ${(error as Error).message}`);
-    }
-  });
+function enqueueWrite<T>(task: () => T): Promise<T> {
+  const run = writeQueue.then(task);
   writeQueue = run.then(() => undefined, () => undefined);
   return run;
 }
@@ -312,11 +641,20 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-function validateDraftPayload(value: unknown): DraftInput {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+function parseJsonObject(text: string): Record<string, unknown> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch (error) {
+    throw new HttpError(400, `invalid JSON: ${(error as Error).message}`);
+  }
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
     throw new HttpError(400, 'request body must be a JSON object');
   }
-  const data = value as Record<string, unknown>;
+  return payload as Record<string, unknown>;
+}
+
+function validateDraftInput(data: Record<string, unknown>): DraftInput {
   if (typeof data.title !== 'string') {
     throw new HttpError(400, 'title must be a string');
   }
@@ -335,12 +673,34 @@ function validateDraftPayload(value: unknown): DraftInput {
   return { title, summary, body: data.body };
 }
 
+// Updates carry the version the editor loaded; stale versions are rejected.
+// As with creation, summary may be omitted (saved as empty string) but a
+// present non-string summary is a 400.
+function validateUpdateInput(data: Record<string, unknown>): DraftInput & { version: number } {
+  const fields = validateDraftInput(data);
+  if (typeof data.version !== 'number' || !Number.isInteger(data.version) || data.version < 0) {
+    throw new HttpError(400, 'version must be a non-negative integer');
+  }
+  return { ...fields, version: data.version };
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   let route: string;
   try { route = new URL(req.url ?? '/', 'http://localhost').pathname; }
   catch { respond(res, 400, { error: 'invalid request path' }); return; }
 
-  if (!['/', '/health', '/api/articles'].includes(route)) { respond(res, 404, { error: 'not found' }); return; }
+  // /api/articles/:id (match the raw path first; decode only the captured id)
+  const itemMatch = /^\/api\/articles\/([^/]+)$/.exec(route);
+  let itemId: string | null = null;
+  if (itemMatch) {
+    try { itemId = decodeURIComponent(itemMatch[1]); }
+    catch { respond(res, 400, { error: 'invalid article id encoding' }); return; }
+  }
+
+  if (!['/', '/health', '/api/articles'].includes(route) && !itemMatch) {
+    respond(res, 404, { error: 'not found' });
+    return;
+  }
 
   if (route === '/') {
     if (req.method === 'GET') { respond(res, 200, PAGE, true); return; }
@@ -353,19 +713,61 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  if (itemMatch && itemId !== null) {
+    const id = itemId;
+    if (req.method === 'GET') {
+      const articles = readArticles();
+      const article = articles.find((a) => a.id === id);
+      if (!article) throw new HttpError(404, 'article not found');
+      respond(res, 200, { article });
+      return;
+    }
+    if (req.method === 'PUT') {
+      const text = await readBody(req);
+      const data = parseJsonObject(text);
+      const fields = validateUpdateInput(data);
+      const result = await enqueueWrite((): { status: number; article: Article } => {
+        const records = readArticles();
+        const index = records.findIndex((a) => a.id === id);
+        if (index === -1) {
+          throw new HttpError(404, 'article not found');
+        }
+        const current = records[index];
+        if (fields.version !== current.version) {
+          // 409 carries the currently saved article for side-by-side comparison.
+          const conflict = new HttpError(409, 'a newer version of this article has been saved');
+          (conflict as HttpError & { article?: Article }).article = current;
+          throw conflict;
+        }
+        const updated: Article = {
+          id: current.id,
+          title: fields.title,
+          summary: fields.summary,
+          body: fields.body,
+          status: current.status,
+          createdAt: current.createdAt,
+          version: current.version + 1,
+        };
+        records[index] = updated;
+        writeArticles(records);
+        return { status: 200, article: updated };
+      });
+      respond(res, result.status, { article: result.article });
+      return;
+    }
+    methodNotAllowed(res, 'GET, PUT');
+    return;
+  }
+
+  // /api/articles
   if (req.method === 'GET') {
     respond(res, 200, { [RESOURCE]: readArticles() });
     return;
   }
   if (req.method === 'POST') {
     const text = await readBody(req);
-    let payload: unknown;
-    try {
-      payload = JSON.parse(text);
-    } catch (error) {
-      throw new HttpError(400, `invalid JSON: ${(error as Error).message}`);
-    }
-    const fields = validateDraftPayload(payload);
+    const data = parseJsonObject(text);
+    const fields = validateDraftInput(data);
     const article: Article = {
       id: randomUUID(),
       title: fields.title,
@@ -373,8 +775,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       body: fields.body,
       status: 'draft',
       createdAt: new Date().toISOString(),
+      version: 1,
     };
-    await saveArticle(article);
+    await enqueueWrite((): void => {
+      const records = readArticles();
+      records.push(article);
+      writeArticles(records);
+    });
     respond(res, 201, { article });
     return;
   }
@@ -385,7 +792,10 @@ const server = createServer((req: IncomingMessage, res: ServerResponse): void =>
   handle(req, res).catch((error: unknown) => {
     if (res.writableEnded) return;
     if (error instanceof HttpError) {
-      respond(res, error.status, { error: error.message });
+      const payload: { error: string; article?: Article } = { error: error.message };
+      const withArticle = error as HttpError & { article?: Article };
+      if (error.status === 409 && withArticle.article) payload.article = withArticle.article;
+      respond(res, error.status, payload);
       return;
     }
     respond(res, 500, { error: error instanceof Error ? error.message : 'internal error' });
