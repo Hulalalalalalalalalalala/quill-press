@@ -105,6 +105,8 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
   var saving = false;
   // null = 新建草稿模式；对象 = 正在编辑的服务端版本 {id,title,summary,body,version}
   var editing = null;
+  // 冲突对照区当前的操作按钮，读取最新内容期间需暂时禁用
+  var conflictActionButtons = [];
 
   function setStatus(text, kind) {
     statusEl.textContent = text || '';
@@ -118,6 +120,10 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
   function hideConflict() {
     conflictBox.hidden = true;
     conflictBox.textContent = '';
+    conflictActionButtons = [];
+  }
+  function setConflictActionsDisabled(disabled) {
+    conflictActionButtons.forEach(function (btn) { btn.disabled = disabled; });
   }
   function formatTime(iso) {
     var d = new Date(iso);
@@ -228,6 +234,13 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       body: article.body,
       version: article.version
     };
+    // 列表同步为本次载入的已保存内容，使该草稿的标题、摘要与“编辑中”标识
+    // 与载入结果一致（载入的可能比列表缓存更新）。
+    var idx = -1;
+    for (var i = 0; i < articles.length; i++) {
+      if (articles[i] && articles[i].id === article.id) { idx = i; break; }
+    }
+    if (idx >= 0) articles[idx] = article; else articles.push(article);
     titleInput.value = article.title == null ? '' : String(article.title);
     summaryInput.value = article.summary == null ? '' : String(article.summary);
     bodyInput.value = article.body == null ? '' : String(article.body);
@@ -251,21 +264,18 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       || bodyInput.value !== editing.body;
   }
 
-  function startEdit(id) {
-    if (saving) return;
-    if (isDirty() && !window.confirm('当前表单有未保存的修改，打开另一篇草稿将放弃这些输入。确定继续吗？')) {
-      return;
-    }
-    // 记录开始读取时的表单快照。读取期间表单仍可继续输入，
-    // 成功返回时据此判断是否有等待期间的新修改需要用户明确取舍。
-    var snapshot = {
+  function formSnapshot() {
+    return {
       title: titleInput.value,
       summary: summaryInput.value,
       body: bodyInput.value
     };
-    setSaving(true, '读取中…');
-    setStatus('正在读取草稿内容…', null);
-    fetch('/api/articles/' + encodeURIComponent(id), { headers: { accept: 'application/json' } })
+  }
+
+  // 通过单篇接口读取草稿当前已保存的完整内容（含正文与 version），
+  // 绝不使用列表里的摘要充当正文。
+  function fetchArticle(id) {
+    return fetch('/api/articles/' + encodeURIComponent(id), { headers: { accept: 'application/json' } })
       .then(function (r) {
         return r.json().catch(function () { return null; }).then(function (data) {
           if (!r.ok || !data || !data.article) {
@@ -273,32 +283,83 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           }
           return data.article;
         });
-      })
+      });
+  }
+
+  // 读取成功后按开始读取时的快照决定载入方式：三个字段均未变（含改动后
+  // 又恢复原值）直接载入；任一字段不同则先说明载入将丢弃等待期间的新修改，
+  // 由用户明确选择。选择保留时全部输入、原编辑对象与原版本基准都保持原状，
+  // 当前输入也不会被当作目标文章的修改。
+  function loadFetchedArticle(snapshot, article, confirmMessage, keepMessage) {
+    if (titleInput.value === snapshot.title
+      && summaryInput.value === snapshot.summary
+      && bodyInput.value === snapshot.body) {
+      applyEditingState(article);
+      return;
+    }
+    if (window.confirm(confirmMessage)) {
+      applyEditingState(article);
+    } else {
+      setStatus(keepMessage, null);
+    }
+  }
+
+  function startEdit(id) {
+    if (saving) return;
+    if (isDirty() && !window.confirm('当前表单有未保存的修改，打开另一篇草稿将放弃这些输入。确定继续吗？')) {
+      return;
+    }
+    // 记录开始读取时的表单快照。读取期间表单仍可继续输入，
+    // 成功返回时据此判断是否有等待期间的新修改需要用户明确取舍。
+    var snapshot = formSnapshot();
+    setSaving(true, '读取中…');
+    setStatus('正在读取草稿内容…', null);
+    fetchArticle(id)
       .then(function (article) {
         setSaving(false);
-        // 正文必须来自单篇接口，绝不使用列表里的摘要充当正文
-        if (titleInput.value === snapshot.title
-          && summaryInput.value === snapshot.summary
-          && bodyInput.value === snapshot.body) {
-          // 等待期间没有新修改（改动后又恢复原值也不算）：照常载入目标草稿
-          applyEditingState(article);
-          return;
-        }
-        // 等待期间有了新输入：绝不能直接回填覆盖。在用户明确选择之前，
-        // 三个字段原样保留，表单仍处原先的新建或编辑原草稿状态，
-        // 绝不把当前输入关联到目标文章。
-        if (window.confirm('目标草稿已读取完成，但等待期间你又修改了标题、摘要或正文。'
-          + '打开目标草稿将放弃这些新修改。\n\n'
-          + '点击“确定”放弃新修改并打开目标草稿；点击“取消”保留当前输入，继续原来的操作。')) {
-          applyEditingState(article);
-        } else {
-          setStatus('已保留当前输入，未打开目标草稿。', null);
-        }
+        loadFetchedArticle(snapshot, article,
+          '目标草稿已读取完成，但等待期间你又修改了标题、摘要或正文。'
+          + '打开目标草稿将放弃这些新修改。\\n\\n'
+          + '点击“确定”放弃新修改并打开目标草稿；点击“取消”保留当前输入，继续原来的操作。',
+          '已保留当前输入，未打开目标草稿。');
       })
       .catch(function (err) {
         setSaving(false);
         saveBtn.textContent = editing ? '保存修改' : '保存草稿';
         setStatus('打开草稿失败：' + (err && err.message ? err.message : err) + '，可稍后重试。', 'err');
+      });
+  }
+
+  // 冲突后点击“放弃当前输入并载入最新内容”：绝不能直接使用冲突响应里
+  // 带回的内容——那之后其他页面可能又保存过，旧对照已过时。始终重新通过
+  // 单篇接口读取发生冲突的同一篇草稿在本次读取时实际保存的版本，读取成功
+  // 后才以其进入编辑状态。该操作只读取，不保存、删除或新建任何记录。
+  function reloadLatestSaved() {
+    if (saving || !editing) return;
+    var id = editing.id;
+    // 不提前清空表单：读取期间标题、摘要和正文仍可继续输入。
+    var snapshot = formSnapshot();
+    setSaving(true, '读取中…');
+    setStatus('正在读取该草稿最新已保存的内容…', null);
+    setConflictActionsDisabled(true);
+    fetchArticle(id)
+      .then(function (article) {
+        setSaving(false);
+        setConflictActionsDisabled(false);
+        loadFetchedArticle(snapshot, article,
+          '最新内容已读取完成，但等待期间你又修改了标题、摘要或正文。'
+          + '载入最新内容将放弃这些新修改。\\n\\n'
+          + '点击“确定”放弃新修改并载入最新内容；点击“取消”保留当前输入。',
+          '已保留当前输入，未载入最新内容。');
+      })
+      .catch(function (err) {
+        // 草稿已不存在或读取失败：保留全部当前输入与原编辑状态，
+        // 恢复可操作状态，不显示载入成功、不退回新建模式。
+        setSaving(false);
+        saveBtn.textContent = editing ? '保存修改' : '保存草稿';
+        setConflictActionsDisabled(false);
+        setStatus('载入最新内容失败：' + (err && err.message ? err.message : err)
+          + '，当前输入与编辑状态已保留，可稍后重试。', 'err');
       });
   }
 
@@ -377,9 +438,9 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     discard.type = 'button';
     discard.className = 'danger';
     discard.textContent = '放弃当前输入并载入最新内容';
-    discard.addEventListener('click', function () {
-      applyEditingState(saved);
-    });
+    // 不直接使用本次冲突响应带回的内容：那之后可能又有新的保存。
+    // 点击后重新读取该草稿当前实际保存的版本，成功后才载入。
+    discard.addEventListener('click', reloadLatestSaved);
     var keep = document.createElement('button');
     keep.type = 'button';
     keep.className = 'secondary';
@@ -396,6 +457,7 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     actions.appendChild(keep);
     actions.appendChild(tip);
     conflictBox.appendChild(actions);
+    conflictActionButtons = [discard, keep];
     conflictBox.hidden = false;
   }
 
