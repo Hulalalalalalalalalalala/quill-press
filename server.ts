@@ -26,7 +26,7 @@ button.secondary{background:#fff;color:#175b9c;margin-left:.6rem}
 button:disabled{opacity:.55;cursor:default}
 button.danger{border-color:#c0392b;background:#fff;color:#c0392b}
 .status{margin:.8rem 0 0;min-height:1.4em}
-.status.ok{color:#1a7f37}.status.err{color:#c0392b}
+.status.ok{color:#1a7f37}.status.err{color:#c0392b}.status.warn{color:#8a5a00}
 .edit-banner{margin:0 0 .25rem;padding:.6rem .8rem;border-radius:6px;background:#eef4fb;border:1px solid #b6d2ee;color:#14467a;font-size:.92rem}
 .edit-banner code{background:#dde9f6;padding:0 .3rem;border-radius:3px}
 .edit-banner .meta{color:#3d6391;font-size:.85rem;margin-top:.2rem}
@@ -383,6 +383,12 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     }
     hideConflict();
     var isEdit = !!editing;
+    // 记录本次实际提交的原始字段值，响应返回时据此判断等待期间哪些字段又被编辑过。
+    var submitted = {
+      title: titleInput.value,
+      summary: summaryInput.value,
+      body: bodyInput.value
+    };
     var payload = {
       title: titleInput.value,
       summary: summaryInput.value,
@@ -431,8 +437,9 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           if (idx >= 0) articles[idx] = article; else articles.push(article);
           render();
           setSaving(false);
-          // 保持编辑态：仍是同一篇草稿，可继续修改
-          applyEditingStateSilent(article, '修改已保存。文章标识、创建时间与草稿状态均未改变。');
+          // 保持编辑态：仍是同一篇草稿，可继续修改。
+          // 成功只确认本次提交的内容；等待响应期间补写的字段原样保留，不被覆盖。
+          mergeSavedEditingState(article, submitted);
         } else {
           articles.push(article);
           render();
@@ -448,28 +455,49 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       });
   });
 
-  // 保存成功后留在编辑态：表单同步为服务端保存的规范内容（标题已去首尾空白），
-  // 本地基准版本一并更新，不清空输入。
-  function applyEditingStateSilent(article, message) {
-    titleInput.value = article.title == null ? '' : String(article.title);
-    summaryInput.value = article.summary == null ? '' : String(article.summary);
-    bodyInput.value = article.body == null ? '' : String(article.body);
+  // 保存成功后留在编辑态。成功响应只能确认本次提交的内容：
+  // 服务端返回的已保存内容成为新的本地基准（version 一并推进，再次保存不会误报冲突），
+  // 但等待响应期间用户继续输入过的字段必须完整保留当前值（含换行、空行与清空操作），
+  // 绝不能用刚保存的旧值回填或替换。
+  function mergeSavedEditingState(article, submitted) {
+    var savedFields = [
+      { key: 'title', label: '标题', el: titleInput, value: article.title == null ? '' : String(article.title) },
+      { key: 'summary', label: '摘要', el: summaryInput, value: article.summary == null ? '' : String(article.summary) },
+      { key: 'body', label: '正文', el: bodyInput, value: article.body == null ? '' : String(article.body) }
+    ];
+    var editedWhileSaving = [];
+    savedFields.forEach(function (f) {
+      if (f.el.value === submitted[f.key]) {
+        // 等待期间未再改动：同步为服务端保存的规范值（例如去首尾空白后的标题）。
+        if (f.el.value !== f.value) f.el.value = f.value;
+      } else {
+        // 等待期间又被修改（包括清空摘要或正文）：保留当前输入，不动一个字符。
+        // 仅当保留下来的当前值确实与本次已保存值不同时，才算仍有未保存修改。
+        if (f.el.value !== f.value) editedWhileSaving.push(f.label);
+      }
+    });
     editing = {
       id: article.id,
-      title: article.title,
-      summary: article.summary,
-      body: article.body,
+      title: savedFields[0].value,
+      summary: savedFields[1].value,
+      body: savedFields[2].value,
       version: article.version
     };
     form.classList.add('editing');
     var code = editBanner.querySelector('code');
-    if (code) code.textContent = String(article.title);
+    if (code) code.textContent = savedFields[0].value;
     editBanner.hidden = false;
     cancelBtn.hidden = false;
     saveBtn.textContent = '保存修改';
     hideConflict();
-    setStatus(message, 'ok');
     render();
+    if (editedWhileSaving.length === 0) {
+      setStatus('修改已保存。文章标识、创建时间与草稿状态均未改变。', 'ok');
+    } else {
+      setStatus('本次提交的内容已保存（文章标识、创建时间与草稿状态不变）。但'
+        + editedWhileSaving.join('、')
+        + '在保存期间又被修改，这些新输入尚未保存；再次点击“保存修改”才会一并存入同一篇草稿。', 'warn');
+    }
   }
 
   load();
