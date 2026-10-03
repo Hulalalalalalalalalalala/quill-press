@@ -42,6 +42,52 @@ async function closeContext({ server, page }, browser) {
   await server.stop();
 }
 
+// Body text exercising plain-text fidelity: Chinese, other scripts, newlines,
+// blank lines and HTML-like markup that must never be parsed or executed.
+const RICH_BODY = '多行正文第一段\n\n中间空行\n\n中文 English café 日本語 العربية 한국어\n\n'
+  + '<script>alert(1)</script>\n<img src=x onerror=alert(2)><b>不应加粗</b>\n<div>末段</div>';
+
+async function getArticle(server, id) {
+  const res = await server.api(`/api/articles/${id}`);
+  assert.equal(res.status, 200);
+  return (await res.json()).article;
+}
+
+// An out-of-band update, exactly as if another tab saved the draft.
+async function updateOut(server, id, fields, version) {
+  const res = await server.api(`/api/articles/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ summary: '', ...fields, version }),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, article: data.article, error: data.error };
+}
+
+// Puts the page into the post-409 state: it opened v1, holds `mine` in the
+// form, and another tab has since saved v2, so the page's save is rejected
+// with the side-by-side conflict comparison.
+async function stageStaleConflict(server, page, v1, mine, v2) {
+  const article = await seedAndReload(server, page, v1);
+  await ui.clickEdit(page, v1.title);
+  await ui.waitLoadedDraft(page);
+  await ui.fill(page, mine);
+  const up = await updateOut(server, article.id, v2, 1);
+  assert.equal(up.status, 200, `other-tab update should succeed: ${up.status} ${up.error || ''}`);
+  await ui.clickSave(page);
+  await ui.waitForStatus(page, '409', 'err');
+  await ui.waitConflictShown(page);
+  return { article, saved: up.article };
+}
+
+// The comparison columns render with textContent: markup-like text must appear
+// verbatim and must not create elements or run handlers (no dialog may fire).
+async function assertConflictPlainText(page) {
+  const injected = await page.eval(
+    `document.querySelectorAll('#conflict-box .ver script,#conflict-box .ver img,#conflict-box .ver b').length`);
+  assert.equal(injected, 0);
+  assert.equal(page.dialogs.length, 0);
+}
+
 // ---------------------------------------------------------------------------
 // 1. Editing an existing draft: save, keep typing during the wait, save again.
 // ---------------------------------------------------------------------------
@@ -517,6 +563,487 @@ test('新建态保存被服务端拒绝：保留新建状态与全部输入，�
     const now = await ui.state(page);
     assert.deepEqual(now.form, { title: '', summary: '', body: '' }); // 无后续输入→清空
     assert.equal(now.saveBtnText, '保存草稿');
+  } finally {
+    await closeContext(ctx, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 8. Two real pages open the same draft. Page A saves first; page B, still on
+//    the old version, saves and must receive 409, keep every input and see a
+//    side-by-side comparison. After the comparison is shown page A saves AGAIN;
+//    page B's “载入最新内容” must fetch that newer version (not reuse the stale
+//    comparison), then a further save updates the same draft with no conflict.
+// ---------------------------------------------------------------------------
+test('两个页面先后保存：旧版本收到409并保留输入对照；对照后对方再存，载入取本次读取内容并可继续更新同一篇', async (browser) => {
+  const server = await TestServer.start();
+  const pageA = await ui.open(browser, server.url);
+  const pageB = await ui.open(browser, server.url);
+  try {
+    const v1 = await seed(server, { title: '共享草稿', summary: '初始摘要', body: '初始正文' });
+    await ui.reload(pageA);
+    await ui.reload(pageB);
+
+    // 两个页面都在任何保存之前打开同一篇草稿，版本基准都是 1。
+    await ui.clickEdit(pageA, '共享草稿');
+    await ui.waitLoadedDraft(pageA);
+    await ui.clickEdit(pageB, '共享草稿');
+    await ui.waitLoadedDraft(pageB);
+
+    // 页面一先保存，成功推进到版本 2。
+    await ui.fill(pageA, {
+      title: '页面一标题',
+      summary: '页面一摘要 <b>不应加粗</b>',
+      body: '页面一正文第一段\n\n页面一正文第二段 <img src=x>',
+    });
+    await ui.clickSave(pageA);
+    await ui.waitForStatus(pageA, '修改已保存', 'ok');
+
+    // 页面二基于旧版本 1 提交自己的内容：必须收到 409。
+    const mine = {
+      title: '页面二标题',
+      summary: '页面二摘要',
+      body: '页面二正文<script>alert("x")</script>',
+    };
+    await ui.fill(pageB, mine);
+    await ui.clickSave(pageB);
+    await ui.waitForStatus(pageB, '409', 'err');
+    await ui.waitConflictShown(pageB);
+
+    let s = await ui.state(pageB);
+    // 明确提示有更新的已保存版本，本次保存被拒绝；全部输入原样保留。
+    assert.match(s.statusText, /存在较新的已保存版本（409）/);
+    assert.deepEqual(s.form, mine);
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerId, v1.id);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.saveDisabled, false);
+    // 并排展示双方标题、摘要、正文：左为未保存输入，右为最新已保存内容。
+    const conflict = await ui.getConflict(pageB);
+    assert.equal(conflict.hidden, false);
+    assert.equal(conflict.heading, '检测到较新的已保存内容');
+    assert.equal(conflict.mine.heading, '你正在编辑的内容（未保存）');
+    assert.deepEqual(
+      { title: conflict.mine.title, summary: conflict.mine.summary, body: conflict.mine.body }, mine);
+    assert.deepEqual(
+      { title: conflict.saved.title, summary: conflict.saved.summary, body: conflict.saved.body },
+      {
+        title: '页面一标题',
+        summary: '页面一摘要 <b>不应加粗</b>',
+        body: '页面一正文第一段\n\n页面一正文第二段 <img src=x>',
+      });
+    // 对照中的类 HTML 文本按纯文本呈现，不产生任何元素、不执行标记。
+    await assertConflictPlainText(pageB);
+    // 本地版本基准没有被 409 推进：再点一次保存仍是 409（而不是误判成功）。
+    await ui.clickSave(pageB);
+    await ui.waitForStatus(pageB, '409', 'err');
+    await ui.waitConflictShown(pageB);
+    let stored = await getArticle(server, v1.id);
+    assert.equal(stored.version, 2);
+    assert.equal((await server.listArticles()).length, 1);
+
+    // 对照出现之后，页面一又保存了新版本（版本 3，含多语言/空行/类 HTML 正文）。
+    const v3 = {
+      title: '第三次标题',
+      summary: '三次摘要 <img src=x onerror=alert(3)>',
+      body: RICH_BODY,
+    };
+    await ui.fill(pageA, v3);
+    await ui.clickSave(pageA);
+    await ui.waitForStatus(pageA, '修改已保存', 'ok');
+    stored = await getArticle(server, v1.id);
+    assert.equal(stored.version, 3);
+
+    // 页面二点击“放弃当前输入并载入最新内容”：读取等待期间没有新修改，直接载入。
+    // 得到的必须是本次读取时实际保存的版本 3，而不是先前 409 对照里的版本 2。
+    await ui.clickDiscardLoad(pageB);
+    await ui.waitLoadedDraft(pageB);
+    s = await ui.state(pageB);
+    assert.deepEqual(s.form, { title: v3.title, summary: v3.summary, body: v3.body });
+    assert.equal(s.bannerId, v1.id);
+    assert.equal(s.conflictHidden, true);
+    assert.equal(s.cards[0].title, v3.title);
+    assert.equal(s.cards[0].summary, v3.summary);
+    assert.equal(s.cards[0].editing, true);
+    assert.equal(
+      await pageB.eval(`document.querySelectorAll('#article-list .summary b,#article-list .summary img,#article-list .summary script').length`),
+      0);
+    stored = await getArticle(server, v1.id);
+    assert.equal(stored.version, 3); // 仅读取，不改变版本
+    assert.equal(stored.body, RICH_BODY);
+    assert.equal(stored.id, v1.id);
+    assert.equal(stored.status, 'draft');
+    assert.equal(stored.createdAt, v1.createdAt);
+
+    // 载入后仍编辑同一篇草稿；在此基础上修改并保存，更新原文章且不误报冲突。
+    await ui.fill(pageB, {
+      title: '页面二接管后的标题',
+      summary: '页面二接管摘要',
+      body: `${RICH_BODY}\n\n接管后补充一行`,
+    });
+    await ui.clickSave(pageB);
+    await ui.waitForStatus(pageB, '修改已保存', 'ok');
+    s = await ui.state(pageB);
+    assert.equal(s.conflictHidden, true);
+    assert.equal(s.cards[0].title, '页面二接管后的标题');
+    assert.equal(s.bannerId, v1.id);
+    stored = await getArticle(server, v1.id);
+    assert.equal(stored.version, 4);
+    assert.equal(stored.id, v1.id);
+    assert.equal(stored.createdAt, v1.createdAt);
+    assert.equal(stored.body, `${RICH_BODY}\n\n接管后补充一行`);
+    const articles = await server.listArticles();
+    assert.equal(articles.length, 1);
+    assert.equal(articles[0].id, v1.id);
+
+    ui.assertNoPageErrors(pageA);
+  } finally {
+    ui.assertNoPageErrors(pageB);
+    await browser.closePage(pageB);
+    await browser.closePage(pageA);
+    await server.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 9. While the post-conflict reload read is in flight: form is not cleared
+//    early, fields stay editable, page shows “正在读取”, save and a repeat
+//    reload are unavailable. Fields changed then reverted count as unchanged,
+//    so the freshly read article loads directly — and it is the version saved
+//    AFTER the comparison, never the stale comparison content.
+// ---------------------------------------------------------------------------
+test('载入等待期间不丢输入且可编辑、保存与重复载入不可用；改动后恢复原值则直接载入本次读取的新版本', async (browser) => {
+  const ctx = await freshContext(browser);
+  const { server, page } = ctx;
+  try {
+    const v1 = { title: '载入基准', summary: '基准摘要', body: '基准正文' };
+    const mine = { title: '我改的标题', summary: '我改的摘要', body: '我改的正文' };
+    const { article } = await stageStaleConflict(server, page, v1, mine, {
+      title: '对方第二版', summary: '对方摘要二', body: '对方正文二',
+    });
+
+    // 对照出现后，对方又保存了第三版；读取请求先挂起，期间对方内容才落库。
+    const v3 = { title: '对方第三版', summary: '对方摘要三', body: '对方正文三' };
+    await ui.readGateOn(page);
+    await ui.clickDiscardLoad(page);
+    await ui.waitReadPending(page, 1);
+
+    let s = await ui.state(page);
+    // 不提前清空：开始读取时的输入一字不动。
+    assert.deepEqual(s.form, mine);
+    assert.deepEqual(s.fieldsEditable, { title: true, summary: true, body: true });
+    assert.equal(s.saveBtnText, '读取中…');
+    assert.equal(s.saveDisabled, true);
+    assert.match(s.statusText, /正在读取/);
+    // 保存与重复载入在读取期间都不可用。
+    await ui.gateOn(page);
+    await ui.clickSave(page); // 禁用按钮：不会产生保存请求
+    assert.deepEqual(await ui.gateState(page), { enabled: true, hits: 0, pending: 0 });
+    const actionsDuring = (await ui.getConflict(page)).actions;
+    assert.deepEqual(actionsDuring.map((b) => b.disabled), [true, true]);
+    await ui.clickDiscardLoad(page); // 重复点击不会发起第二次读取
+    assert.deepEqual(await ui.readGateState(page), { enabled: true, hits: 1, pending: 1 });
+
+    // 读取期间三个字段都改过，随后又逐一恢复为开始读取时的原值。
+    await ui.fill(page, { title: '临时标题', summary: '临时摘要', body: '临时正文' });
+    await ui.fill(page, mine);
+    s = await ui.state(page);
+    assert.deepEqual(s.form, mine);
+
+    // 挂起期间对方第三版落库；放行读取，返回的应当是版本 3。
+    const up = await updateOut(server, article.id, v3, 2);
+    assert.equal(up.status, 200);
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.gateOff(page);
+    await ui.waitLoadedDraft(page);
+
+    s = await ui.state(page);
+    // 改动后恢复原值视为未修改：直接载入，不弹确认。
+    assert.deepEqual((await ui.confirmState(page)).calls, []);
+    assert.deepEqual(s.form, v3); // 不是 409 对照里的第二版
+    assert.equal(s.bannerId, article.id);
+    assert.equal(s.cards[0].title, v3.title);
+    assert.equal(s.cards[0].editing, true);
+    // 读取本身不保存、不推进版本。
+    const stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 3);
+    assert.deepEqual({ title: stored.title, summary: stored.summary, body: stored.body }, v3);
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await closeContext(ctx, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 10. During the reload read a field still has a new edit when the response
+//     arrives: the page must first explain that loading discards those edits.
+//     Choosing “保留” keeps every input, the original editing target and the
+//     original version baseline; nothing is saved and no version changes.
+// ---------------------------------------------------------------------------
+test('读取返回时仍有新修改：说明会放弃输入；选择保留则输入/编辑对象/版本基准全部不变且不保存', async (browser) => {
+  const ctx = await freshContext(browser);
+  const { server, page } = ctx;
+  try {
+    const { article } = await stageStaleConflict(server, page,
+      { title: '保留基准', summary: '基准摘要', body: '基准正文' },
+      { title: '冲突时标题', summary: '冲突时摘要', body: '冲突时正文' },
+      { title: '对方第二版', summary: '对方摘要二', body: '对方正文二' });
+
+    await ui.setConfirm(page, 'cancel'); // 用户选择保留当前输入
+    await ui.readGateOn(page);
+    await ui.resetConfirm(page);
+    await ui.clickDiscardLoad(page);
+    await ui.waitReadPending(page, 1);
+    const kept = {
+      title: '读取期间又改的标题',
+      summary: '读取期间又改的摘要 <script>alert(1)</script>',
+      body: '读取期间又改的正文\n\n第二段',
+    };
+    await ui.fill(page, kept);
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitForStatus(page, '已保留当前输入，未载入最新内容');
+
+    const confirm = await ui.confirmState(page);
+    assert.equal(confirm.calls.length, 1);
+    assert.match(confirm.calls[0], /载入最新内容将放弃这些新修改/);
+    let s = await ui.state(page);
+    // 当前全部输入原样保留（含类 HTML 文本，按纯文本留在表单中）。
+    assert.deepEqual(s.form, kept);
+    // 原编辑对象不变。
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerId, article.id);
+    assert.equal(s.bannerHidden, false);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.saveDisabled, false);
+    // 仍停留在冲突处理界面，按钮恢复可用，没有显示载入成功。
+    assert.equal(s.conflictHidden, false);
+    assert.deepEqual((await ui.getConflict(page)).actions.map((b) => b.disabled), [false, false]);
+    assert.ok(!s.statusText.includes('已载入'));
+    // 读取/保留都不保存：文章仍是对方保存的第二版，记录数不变。
+    let stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 2);
+    assert.equal((await server.listArticles()).length, 1);
+    // 类 HTML 文本没有被解析或执行。
+    assert.equal(await page.eval(`document.querySelectorAll('#conflict-box script,#conflict-box img').length`), 0);
+
+    // 版本基准保持旧值：再次保存仍应收到 409（而不是沿用载入内容误判成功）。
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '409', 'err');
+    await ui.waitConflictShown(page);
+    s = await ui.state(page);
+    assert.deepEqual(s.form, kept);
+    stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 2);
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await closeContext(ctx, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 11. Same in-flight edit, but the user confirms “放弃”: editing continues
+//     with this read's complete content; a follow-up save updates the original
+//     draft on the new baseline with no false conflict.
+// ---------------------------------------------------------------------------
+test('读取返回时有新修改：选择放弃则以本次读取的完整内容继续编辑，再保存更新同一篇且不误报冲突', async (browser) => {
+  const ctx = await freshContext(browser);
+  const { server, page } = ctx;
+  try {
+    const { article } = await stageStaleConflict(server, page,
+      { title: '放弃基准', summary: '基准摘要', body: '基准正文' },
+      { title: '冲突时标题', summary: '冲突时摘要', body: '冲突时正文' },
+      { title: '对方第二版', summary: '对方摘要二', body: '对方正文二' });
+
+    // 对方在对照出现后又保存第三版。
+    const v3 = { title: '对方第三版', summary: '对方摘要三', body: `对方正文三\n\n空行\n中文 English` };
+    const up = await updateOut(server, article.id, v3, 2);
+    assert.equal(up.status, 200);
+
+    await ui.setConfirm(page, 'accept'); // 用户选择放弃等待期间的输入
+    await ui.readGateOn(page);
+    await ui.resetConfirm(page);
+    await ui.clickDiscardLoad(page);
+    await ui.waitReadPending(page, 1);
+    await ui.fill(page, { title: '读取期间新改', summary: '读取期间新摘要', body: '读取期间新正文' });
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitLoadedDraft(page);
+
+    const confirm = await ui.confirmState(page);
+    assert.equal(confirm.calls.length, 1);
+    assert.match(confirm.calls[0], /放弃新修改并载入最新内容/);
+    let s = await ui.state(page);
+    // 等待期间的新修改被放弃，以本次读取到的第三版完整内容继续编辑。
+    assert.deepEqual(s.form, v3);
+    assert.equal(s.bannerId, article.id);
+    assert.equal(s.conflictHidden, true);
+    assert.equal(s.cards[0].title, v3.title);
+    assert.equal(s.cards[0].summary, v3.summary);
+    assert.equal(s.cards[0].editing, true);
+    // 仅完成读取与放弃选择，尚未保存：版本仍是 3。
+    assert.equal((await getArticle(server, article.id)).version, 3);
+
+    // 在载入内容基础上修改保存：按新版本基准更新同一篇，不能误报冲突。
+    await ui.fill(page, { title: '放弃后再编辑标题', body: `${v3.body}\n再补充一段` });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '修改已保存', 'ok');
+    s = await ui.state(page);
+    assert.equal(s.conflictHidden, true);
+    assert.equal(s.bannerId, article.id);
+    const stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 4);
+    assert.equal(stored.id, article.id);
+    assert.equal(stored.title, '放弃后再编辑标题');
+    assert.equal(stored.body, `${v3.body}\n再补充一段`);
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await closeContext(ctx, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 12. Clearing the summary or body during the read is itself an edit that must
+//     be protected: confirmation is required, “保留” keeps the emptied fields;
+//     a later clean reload restores the saved content.
+// ---------------------------------------------------------------------------
+test('读取等待期间清空摘要或正文：清空属于受保护修改，保留时空字段不丢，重新读取可恢复', async (browser) => {
+  const ctx = await freshContext(browser);
+  const { server, page } = ctx;
+  try {
+    const { article } = await stageStaleConflict(server, page,
+      { title: '清空保护基准', summary: '原摘要非空', body: '原正文非空' },
+      { title: '冲突时标题', summary: '冲突时摘要非空', body: '冲突时正文非空' },
+      { title: '对方第二版', summary: '对方摘要二非空', body: '对方正文二非空' });
+
+    await ui.setConfirm(page, 'cancel');
+    await ui.readGateOn(page);
+    await ui.resetConfirm(page);
+    await ui.clickDiscardLoad(page);
+    await ui.waitReadPending(page, 1);
+    // 等待期间把摘要和正文都清空。
+    await ui.fill(page, { summary: '', body: '' });
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitForStatus(page, '已保留当前输入，未载入最新内容');
+
+    // 清空操作同样触发了“载入将放弃修改”的说明。
+    assert.equal((await ui.confirmState(page)).calls.length, 1);
+    let s = await ui.state(page);
+    assert.deepEqual(s.form, { title: '冲突时标题', summary: '', body: '' });
+    assert.equal(s.bannerId, article.id);
+    assert.equal(s.formEditing, true);
+    // 文章内容与版本不受影响。
+    let stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 2);
+    assert.notEqual(stored.summary, '');
+    assert.notEqual(stored.body, '');
+
+    // 不再改动，重新载入：直接恢复对方保存的完整内容（无需再确认）。
+    const callsBefore = (await ui.confirmState(page)).calls.length;
+    await ui.clickDiscardLoad(page);
+    await ui.waitLoadedDraft(page);
+    s = await ui.state(page);
+    assert.deepEqual(s.form, { title: '对方第二版', summary: '对方摘要二非空', body: '对方正文二非空' });
+    assert.equal((await ui.confirmState(page)).calls.length, callsBefore);
+    stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 2); // 仍然只是读取
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await closeContext(ctx, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 13. The reload read reports the draft is gone (404), fails server-side (500)
+//     or fails on the network: show the concrete reason, keep the input present
+//     when the response arrived and the original editing state, restore the
+//     buttons, never claim success or fall back to create mode. Nothing is
+//     saved; once reads work again, loading and then saving succeed.
+// ---------------------------------------------------------------------------
+test('载入读取返回404/500/网络失败：显示具体原因、保留响应到达时的输入与编辑状态、恢复按钮，不退回新建态', async (browser) => {
+  const ctx = await freshContext(browser);
+  const { server, page } = ctx;
+  try {
+    const mine = { title: '失败时标题', summary: '失败时摘要', body: '失败时正文' };
+    const { article } = await stageStaleConflict(server, page,
+      { title: '读失败基准', summary: '基准摘要', body: '基准正文' },
+      mine,
+      { title: '对方第二版', summary: '对方摘要二', body: '对方正文二' });
+
+    // 404（草稿已不存在）：先挂起读取，等待期间继续输入，再让失败响应到达。
+    await ui.readGateOn(page);
+    await ui.armReadFailure(page, 404);
+    await ui.clickDiscardLoad(page);
+    await ui.waitReadPending(page, 1);
+    let s = await ui.state(page);
+    assert.match(s.statusText, /正在读取/);
+    assert.deepEqual(s.fieldsEditable, { title: true, summary: true, body: true });
+    await ui.fill(page, { title: `${mine.title} 响应到达前补写` });
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitForStatus(page, '载入最新内容失败', 'err');
+    s = await ui.state(page);
+    assert.match(s.statusText, /该草稿已不存在/);
+    assert.equal(s.statusKind, 'err');
+    assert.deepEqual(s.form, { title: `${mine.title} 响应到达前补写`, summary: mine.summary, body: mine.body });
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerHidden, false);
+    assert.equal(s.bannerId, article.id);
+    assert.equal(s.cancelHidden, false);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.saveDisabled, false);
+    assert.equal(s.conflictHidden, false);
+    assert.deepEqual((await ui.getConflict(page)).actions.map((b) => b.disabled), [false, false]);
+    assert.ok(!s.statusText.includes('已载入'));
+    assert.equal(await ui.readFailureArmed(page), null);
+    let stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 2);
+    assert.equal((await server.listArticles()).length, 1);
+
+    // 500：读取失败，同样保留全部输入与编辑状态。
+    await ui.armReadFailure(page, 500);
+    await ui.clickDiscardLoad(page);
+    await ui.waitForStatus(page, '载入最新内容失败', 'err');
+    s = await ui.state(page);
+    assert.match(s.statusText, /单篇读取暂时不可用/);
+    assert.equal(s.statusKind, 'err');
+    assert.equal(s.bannerId, article.id);
+    assert.equal(s.formEditing, true);
+    assert.equal(s.saveDisabled, false);
+    assert.deepEqual(s.form, { title: `${mine.title} 响应到达前补写`, summary: mine.summary, body: mine.body });
+    stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 2);
+
+    // 网络层失败：错误原因仍然具体可见。
+    await ui.armReadFailure(page, 'network');
+    await ui.clickDiscardLoad(page);
+    await ui.waitForStatus(page, '载入最新内容失败', 'err');
+    s = await ui.state(page);
+    assert.match(s.statusText, /网络连接中断/);
+    assert.equal(s.bannerId, article.id);
+    assert.equal(s.formEditing, true);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.saveDisabled, false);
+    stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 2);
+    assert.equal((await server.listArticles()).length, 1);
+
+    // 读取恢复后可正常载入，且编辑状态/版本基准正确，随后能保存更新同一篇。
+    await ui.clickDiscardLoad(page);
+    await ui.waitLoadedDraft(page);
+    s = await ui.state(page);
+    assert.deepEqual(s.form, { title: '对方第二版', summary: '对方摘要二', body: '对方正文二' });
+    assert.equal(s.bannerId, article.id);
+    await ui.fill(page, { body: '恢复后保存的正文' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '修改已保存', 'ok');
+    stored = await getArticle(server, article.id);
+    assert.equal(stored.version, 3);
+    assert.equal(stored.id, article.id);
+    assert.equal(stored.body, '恢复后保存的正文');
+    assert.equal((await server.listArticles()).length, 1);
   } finally {
     await closeContext(ctx, browser);
   }
