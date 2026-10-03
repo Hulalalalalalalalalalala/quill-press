@@ -81,7 +81,8 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
 
 <section aria-labelledby="list-heading">
 <h2 id="list-heading">草稿列表</h2>
-<ul id="article-list" class="articles"></ul>
+<ul id="article-list" class="articles" aria-busy="true"></ul>
+<p id="list-notice" class="empty err" role="status" aria-live="polite" hidden></p>
 <p id="empty-tip" class="empty">草稿加载中…</p>
 </section>
 
@@ -101,7 +102,13 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
   var conflictBox = document.getElementById('conflict-box');
   var listEl = document.getElementById('article-list');
   var emptyTip = document.getElementById('empty-tip');
+  var listNotice = document.getElementById('list-notice');
   var articles = [];
+  // 首次列表读取是否已结束（成功或失败）。结果到达前用户保存的草稿绝不能
+  // 被随后到达的旧快照覆盖；失败时这些已保存卡片也要继续保留。
+  var listLoaded = false;
+  // 首次列表读取失败的具体原因；空字符串表示当前没有失败。
+  var listError = '';
   var saving = false;
   // null = 新建草稿模式；对象 = 正在编辑的服务端版本 {id,title,summary,body,version}
   var editing = null;
@@ -173,22 +180,90 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       li.appendChild(card);
       listEl.appendChild(li);
     });
-    setEmpty(sorted.length === 0 ? '还没有保存的草稿。' : '');
+    renderListChrome(sorted.length);
   }
+
+  function setNotice(text) {
+    listNotice.textContent = text || '';
+    listNotice.hidden = !text;
+  }
+
+  // 列表区在“加载中 / 已取得完整列表 / 加载失败”三种状态下分别该显示什么。
+  // 失败时绝不说成“还没有保存的草稿”：有本页面已保存的卡片就说明列表可能
+  // 不完整、保存成功的草稿仍然保留；一张卡片都没有时也只显示真实失败原因。
+  function renderListChrome(count) {
+    listEl.setAttribute('aria-busy', listLoaded ? 'false' : 'true');
+    if (listError) {
+      setEmpty('');
+      setNotice('草稿列表加载失败，完整列表尚未取得：' + listError
+        + (count > 0 ? '。以下是本页面已经保存成功的草稿，仍然保留并可正常打开编辑。' : ''));
+    } else if (!listLoaded) {
+      setNotice('');
+      setEmpty(count === 0 ? '草稿加载中…' : '');
+    } else {
+      setNotice('');
+      setEmpty(count === 0 ? '还没有保存的草稿。' : '');
+    }
+  }
+
+  function versionNumberOf(article) {
+    var v = article && article.version;
+    return typeof v === 'number' && isFinite(v) ? v : 0;
+  }
+
+  // 首次列表结果与本页面状态合并，而不是整体替换：
+  // - 本页面已保存成功的文章必须保留；标题相同但标识不同的文章仍是两条
+  //   记录，结果带回的其他文章也一并并入；
+  // - 同一标识只保留一条：迟到的初始结果是页面上最旧的一份快照，同 id 时
+  //   只有版本不旧于本地已知版本的数据才能覆盖，列表不能退回旧标题、摘要
+  //   或版本（版本缺失按 0 处理，兼容旧数据）；
+  // - 结果按创建时间倒序排列仍由 render 处理。
+  // 合并只影响列表数据，绝不触碰表单输入、编辑对象与已取得的版本基准。
+  function mergeInitialList(incoming) {
+    var merged = articles.slice();
+    var indexById = Object.create(null);
+    merged.forEach(function (article, i) { indexById[String(article.id)] = i; });
+    incoming.forEach(function (incomingArticle) {
+      if (!incomingArticle || incomingArticle.id == null) return;
+      var key = String(incomingArticle.id);
+      var localIndex = Object.prototype.hasOwnProperty.call(indexById, key)
+        ? indexById[key] : -1;
+      if (localIndex < 0) {
+        indexById[key] = merged.length;
+        merged.push(incomingArticle);
+        return;
+      }
+      if (versionNumberOf(incomingArticle) < versionNumberOf(merged[localIndex])) {
+        return; // 迟到结果里的旧版本：保留本地已有的较新已保存内容
+      }
+      merged[localIndex] = incomingArticle;
+    });
+    articles = merged;
+  }
+
   function load() {
     return fetch('/api/articles', { headers: { accept: 'application/json' } })
       .then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (!r.ok) {
+          return r.json().catch(function () { return null; }).then(function (data) {
+            throw new Error(data && data.error ? data.error : ('HTTP ' + r.status));
+          });
+        }
         return r.json();
       })
       .then(function (data) {
-        articles = data && Array.isArray(data.articles) ? data.articles : [];
+        var incoming = data && Array.isArray(data.articles) ? data.articles : [];
+        mergeInitialList(incoming);
+        listError = '';
+        listLoaded = true;
         render();
       })
       .catch(function (err) {
-        articles = [];
-        listEl.textContent = '';
-        setEmpty('草稿列表加载失败：' + (err && err.message ? err.message : err), 'err');
+        // 首次列表读取失败：保留本页面已成功保存并显示的草稿，绝不用空
+        // 结果替换列表，也不把“列表加载失败”说成保存失败或“没有草稿”。
+        listError = err && err.message ? err.message : String(err);
+        listLoaded = true;
+        render();
       });
   }
 

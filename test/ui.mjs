@@ -3,14 +3,19 @@
 // The core of every scenario is a race the product must survive: the user
 // clicks save (or asks to reload the latest saved content), then keeps typing
 // while the request is in flight. Real network round-trips are too fast to
-// type against reliably, so before the page's own scripts run we install two
+// type against reliably, so before the page's own scripts run we install three
 // independent gates on window.fetch:
 //   - save gate: holds POST/PUT /api/articles calls until the test releases;
 //   - read gate: holds GET /api/articles/:id calls (the single-article read
-//     used by “编辑” and by the post-conflict “载入最新内容” button).
-// The list fetch always passes through untouched. A one-shot failure arm can
-// also make the next single-article read fail (404/500/network) without any
-// test-only branch in the product.
+//     used by “编辑” and by the post-conflict “载入最新内容” button);
+//   - list gate: holds the initial GET /api/articles. Two modes reproduce the
+//     first-load race deterministically: 'captured' sends the request at once
+//     and parks the server's pre-save response (a genuine stale snapshot),
+//     while 'deferred' does not send until release (so the response already
+//     contains the just-saved draft). A one-shot list failure (500/network)
+//     can be parked the same way.
+// The list gate is armed through URL query parameters before navigation, so it
+// is in place before the page's own load() runs.
 //
 // window.confirm is replaced by a controllable double (accept/cancel/native),
 // because the reload flow asks the user to choose between keeping the current
@@ -22,6 +27,24 @@ const INIT_SOURCE = `(function () {
   var readGate = { enabled: false, hits: 0, pending: [] };
   // null = off; 404/500 = respond with that status once; 'network' = reject once.
   var failNextRead = null;
+
+  // Armed via URL query (?__qtest_list_hold=captured|deferred,
+  // ?__qtest_list_fail=500|network) so they are active before the page
+  // script's first load() runs. Consumed once on installation.
+  var qp = new URLSearchParams(location.search);
+  var holdMode = qp.get('__qtest_list_hold');
+  var failNextList = qp.get('__qtest_list_fail');
+  // Consume the arming parameters so a later ordinary reload does not re-arm.
+  if (holdMode !== null || failNextList !== null) {
+    try { window.history.replaceState(null, '', location.pathname); } catch (e) { /* ignore */ }
+  }
+  var listGate = {
+    enabled: holdMode !== null || failNextList !== null,
+    hits: 0,
+    pending: [],
+    captured: 0,
+    mode: holdMode === 'captured' ? 'captured' : 'deferred'
+  };
 
   function methodOf(init) { return ((init && init.method) || 'GET').toUpperCase(); }
   function pathOf(input) {
@@ -35,11 +58,20 @@ const INIT_SOURCE = `(function () {
   function isItemRead(path, method) {
     return method === 'GET' && /^\\/api\\/articles\\/[^/]+$/.test(path);
   }
+  function isListRead(path, method) {
+    return method === 'GET' && path === '/api/articles';
+  }
   function hold(gate, input, init) {
     gate.hits++;
     return new Promise(function (resolve) {
       gate.pending.push(function () { resolve(origFetch(input, init)); });
     });
+  }
+  function releaseGate(gate) {
+    var pending = gate.pending;
+    gate.pending = [];
+    pending.forEach(function (run) { run(); });
+    return pending.length;
   }
 
   function failureResponse(mode) {
@@ -64,9 +96,48 @@ const INIT_SOURCE = `(function () {
     return origFetch(input, init);
   }
 
+  function listFailureResult(mode) {
+    if (mode === 'network') {
+      return Promise.reject(new Error('模拟的网络连接中断'));
+    }
+    return Promise.resolve(new Response(JSON.stringify({
+      error: '模拟失败：文章列表暂时不可用'
+    }), { status: Number(mode), headers: { 'content-type': 'application/json' } }));
+  }
+
+  // Initial list fetch. With a parked failure the response (or rejection) is
+  // delivered at release. In 'captured' mode the request goes out immediately
+  // and the real pre-save Response is held back; in 'deferred' mode the request
+  // itself waits for release, so the server answers from its current data.
+  function runListRead(input, init) {
+    listGate.hits++;
+    var capturedPromise = null;
+    if (listGate.mode === 'captured' && failNextList === null) {
+      capturedPromise = origFetch(input, init);
+      capturedPromise.then(function () { listGate.captured++; },
+        function () { listGate.captured++; });
+    }
+    return new Promise(function (resolve, reject) {
+      listGate.pending.push(function () {
+        if (failNextList !== null) {
+          var mode = failNextList;
+          failNextList = null;
+          listFailureResult(mode).then(resolve, reject);
+          return;
+        }
+        if (capturedPromise) { resolve(capturedPromise); return; }
+        resolve(origFetch(input, init));
+      });
+    });
+  }
+
   window.fetch = function (input, init) {
     var path = pathOf(input);
     var method = methodOf(init);
+    if (isListRead(path, method)) {
+      if (listGate.enabled) return runListRead(input, init);
+      return origFetch(input, init);
+    }
     if (isItemRead(path, method)) {
       if (readGate.enabled) {
         readGate.hits++;
@@ -143,6 +214,21 @@ const INIT_SOURCE = `(function () {
     readGateState: function () { return gateView(readGate); },
     armReadFailure: function (mode) { failNextRead = mode; },
     readFailureArmed: function () { return failNextRead; },
+    listGateOn: function (mode) {
+      listGate.enabled = true;
+      listGate.mode = mode === 'captured' ? 'captured' : 'deferred';
+      listGate.hits = 0;
+      listGate.captured = 0;
+    },
+    listGateOff: function () { listGate.enabled = false; },
+    releaseList: function () { return releaseGate(listGate); },
+    listGateState: function () {
+      var view = gateView(listGate);
+      view.captured = listGate.captured;
+      view.mode = listGate.mode;
+      return view;
+    },
+    armListFailure: function (mode) { failNextList = mode; },
     confirmMode: function (mode) { confirmBox.mode = mode; },
     confirmReset: function () { confirmBox.calls = []; },
     confirmState: function () {
@@ -188,6 +274,9 @@ const INIT_SOURCE = `(function () {
       conflictHidden: document.getElementById('conflict-box').hidden,
       cards: cards,
       listCount: cards.length,
+      listBusy: document.getElementById('article-list').getAttribute('aria-busy') !== 'false',
+      listNoticeHidden: document.getElementById('list-notice').hidden,
+      listNotice: document.getElementById('list-notice').textContent,
       emptyTip: document.getElementById('empty-tip').textContent
     };
   };
@@ -199,17 +288,37 @@ export async function open(browser, baseUrl) {
   await page.addInitScript(INIT_SOURCE);
   await page.goto(baseUrl);
   // Initial list fetch has settled.
-  await page.waitFor(
-    'function(){return !document.getElementById("empty-tip").textContent.includes("加载中");}',
-    { label: 'initial draft list settled' });
+  await waitListSettled(page);
   return page;
+}
+
+// Opens the homepage with the initial GET /api/articles parked by the list
+// gate, before the page's own load() has handled any response.
+//   hold: 'captured' (request already answered by the server with the current
+//   data, response is held in the page) or 'deferred' (request not sent yet);
+//   fail: when set ('500' | 'network'), the parked call fails on release.
+export async function openWithListHeld(browser, baseUrl, { hold = 'deferred', fail = null } = {}) {
+  const params = new URLSearchParams();
+  if (fail) params.set('__qtest_list_fail', String(fail));
+  else params.set('__qtest_list_hold', hold);
+  const page = await browser.newPage();
+  await page.enable();
+  await page.addInitScript(INIT_SOURCE);
+  await page.goto(`${baseUrl}/?${params.toString()}`);
+  await waitListPending(page, 1);
+  return page;
+}
+
+export function waitListSettled(page) {
+  return page.waitFor(
+    'function(){return !document.getElementById("empty-tip").textContent.includes("加载中")'
+      + ' && document.getElementById("article-list").getAttribute("aria-busy")==="false";}',
+    { label: 'initial draft list settled' });
 }
 
 export async function reload(page) {
   await page.reload();
-  await page.waitFor(
-    'function(){return !document.getElementById("empty-tip").textContent.includes("加载中");}',
-    { label: 'draft list settled after reload' });
+  await waitListSettled(page);
 }
 
 export async function fill(page, fields) {
@@ -260,6 +369,20 @@ export async function armReadFailure(page, mode) {
 }
 export function readFailureArmed(page) {
   return page.eval(`__qtest.readFailureArmed()`);
+}
+
+// Initial list gate (GET /api/articles), armed before the page script loads.
+export async function releaseList(page) { return page.eval(`__qtest.releaseList()`); }
+export function listGateState(page) { return page.eval(`__qtest.listGateState()`); }
+export function waitListPending(page, count = 1) {
+  return page.waitFor(
+    `function(){var g=__qtest.listGateState();return g.pending===${count};}`,
+    { timeout: 5000, label: `initial list request #${count} parked` });
+}
+export function waitListBusy(page, busy) {
+  return page.waitFor(
+    `function(){return __snap().listBusy===${busy ? 'true' : 'false'};}`,
+    { timeout: 5000, label: `list ${busy ? 'loading' : 'settled'}` });
 }
 
 // Control the page's window.confirm double.

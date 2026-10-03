@@ -1051,6 +1051,290 @@ test('载入读取返回404/500/网络失败：显示具体原因、保留响应
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 14. First-load race, stale-snapshot variant: the initial GET /api/articles
+//     was answered before the page saved (a genuinely stale response) and is
+//     only delivered afterwards. The just-saved draft must stay, the drafts
+//     brought back by the late response must also appear, nothing duplicates —
+//     same title with a different id is still two records — and order stays
+//     newest-first.
+// ---------------------------------------------------------------------------
+test('首次列表结果（保存前的旧快照）晚于保存成功到达：新草稿保留、其他草稿并入、不重复、不倒序', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    // 这两篇在页面打开前就已落库，会出现在被挂起的旧快照里。
+    const seeded1 = await seed(server, { title: '同名草稿', summary: '服务端同名第一篇', body: 'b1' });
+    const seeded2 = await seed(server, { title: '旧草稿', summary: '旧摘要', body: 'b2' });
+
+    // captured：页面加载时列表请求已发出，服务端以保存前的数据应答，响应被扣在页面里。
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'captured' });
+    try {
+      let s = await ui.state(page);
+      assert.equal(s.listBusy, true);
+      assert.equal(s.emptyTip, '草稿加载中…');
+      assert.equal(s.listCount, 0);
+
+      // 加载期间照常新建：标题与已有草稿相同，但标识不同，仍是两条记录。
+      await ui.fill(page, { title: '同名草稿', summary: '本页面新建的同名稿', body: '本页面正文' });
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '草稿已保存', 'ok');
+      s = await ui.state(page);
+      // 旧结果到达前，列表只显示本页面已保存成功的这一篇。
+      assert.equal(s.listCount, 1);
+      assert.equal(s.cards[0].title, '同名草稿');
+      assert.equal(s.cards[0].summary, '本页面新建的同名稿');
+      assert.deepEqual(s.form, { title: '', summary: '', body: '' }); // 表单已清空，留在新建态
+
+      // 迟到的旧快照（只含保存前的两篇）到达。
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+      s = await ui.state(page);
+
+      assert.equal(s.listCount, 3, '本页面草稿与结果带回的草稿都应显示');
+      assert.equal(s.listNoticeHidden, true);
+      assert.equal(s.emptyTip, '');
+      // 顺序与服务端数据按创建时间倒序的结果一致（同名两篇标题序列相同即可）。
+      const apiArticles = await server.listArticles();
+      const expectedTitles = apiArticles
+        .slice()
+        .sort((x, y) => (x.createdAt < y.createdAt ? 1 : x.createdAt > y.createdAt ? -1 : 0))
+        .map((art) => art.title);
+      assert.deepEqual(s.cards.map((card) => card.title), expectedTitles);
+      assert.deepEqual(s.cards.map((card) => card.title).slice(0, 1), ['同名草稿']); // 本页面新建的最新
+      // 三篇标识互不相同，新草稿没有被显示两次。
+      const ids = apiArticles.map((art) => art.id);
+      assert.equal(new Set(ids).size, 3);
+      assert.ok(ids.includes(seeded1.id) && ids.includes(seeded2.id));
+      assert.equal(apiArticles.length, 3);
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 15. First-load race, fresh-response variant: the list request itself is
+//     delayed until after the save, so the response already contains the
+//     just-saved draft. It must appear exactly once.
+// ---------------------------------------------------------------------------
+test('首次列表请求晚于保存发出、结果已含新草稿：只显示一条且顺序正确', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    await seed(server, { title: '已有草稿', summary: '早先摘要', body: '早先正文' });
+    // deferred：列表请求在放行前根本没有发出，服务端将按保存后的当前数据应答。
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'deferred' });
+    try {
+      await ui.fill(page, { title: '页面新草稿', summary: '页面摘要', body: '页面正文' });
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '草稿已保存', 'ok');
+      let s = await ui.state(page);
+      assert.equal(s.listCount, 1);
+
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+      s = await ui.state(page);
+      assert.equal(s.listCount, 2);
+      assert.deepEqual(s.cards.map((card) => card.title), ['页面新草稿', '已有草稿']);
+      assert.equal(s.cards.filter((card) => card.title === '页面新草稿').length, 1);
+      assert.equal(s.cards[0].summary, '页面摘要');
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 16. The page saves the draft, then edits and saves it again while the stale
+//     list response is still in flight. That response carries the older
+//     title/summary/version; merging must not roll the card back, must not
+//     change the editing target or version baseline (a further save updates
+//     the same draft with no false 409), and unsaved typing during the first
+//     save must never be treated as saved.
+// ---------------------------------------------------------------------------
+test('迟到列表结果带着已保存文章的旧版本：列表不退回旧内容，编辑对象/版本基准/未提交输入不变', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'captured' });
+    try {
+      // 第一篇：保存等待期间补写正文（尚未提交），保存成功后表单关联到该草稿。
+      await ui.gateOn(page);
+      await ui.fill(page, { title: '第一版标题', summary: '第一版摘要', body: '第一版正文' });
+      await ui.clickSave(page);
+      await ui.waitSavingPending(page, 1);
+      await ui.fill(page, { body: '第一版正文\n\n保存期间补写、尚未提交的段落' });
+      await ui.releaseSaves(page);
+      await ui.gateOff(page);
+      await ui.waitForStatus(page, '尚未保存', 'warn');
+      let s = await ui.state(page);
+      assert.equal(s.listCount, 1);
+      assert.equal(s.cards[0].title, '第一版标题');
+      assert.equal(s.formEditing, true);
+      const bannerId = s.bannerId;
+
+      // 再保存一次，把等待期间的补写落库为版本 2，并改标题、摘要。
+      await ui.fill(page, { title: '第二版标题', summary: '第二版摘要' });
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '修改已保存', 'ok');
+      s = await ui.state(page);
+      assert.equal(s.cards[0].title, '第二版标题');
+      assert.equal(s.cards[0].summary, '第二版摘要');
+
+      // 第二版已保存后，再补写一段但不提交；此时放行旧快照。
+      await ui.fill(page, { body: `${s.form.body}\n\n又补写了一段、列表到达时仍未提交` });
+      const storedV2 = await (await server.api(`/api/articles/${bannerId}`)).json();
+      assert.equal(storedV2.article.version, 2);
+      assert.ok(!storedV2.article.body.includes('仍未提交'));
+
+      // 此时放行被扣住的首次列表结果：它只知道版本 1 的“第一版标题/第一版摘要”。
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+      s = await ui.state(page);
+      assert.equal(s.listCount, 1, '同一篇草稿不能显示两次');
+      assert.equal(s.cards[0].title, '第二版标题', '列表不能退回旧标题');
+      assert.equal(s.cards[0].summary, '第二版摘要', '列表不能退回旧摘要');
+      assert.equal(s.cards[0].editing, true, '编辑中的标记不能丢');
+      assert.equal(s.bannerId, bannerId, '编辑对象不能被列表更新改变');
+      assert.equal(s.saveBtnText, '保存修改');
+      // 保存期间补写但尚未提交的内容既不能丢，也不能被列表更新当成已保存。
+      assert.match(s.form.body, /又补写了一段、列表到达时仍未提交/);
+      const storedAfterMerge = await (await server.api(`/api/articles/${bannerId}`)).json();
+      assert.equal(storedAfterMerge.article.version, 2);
+      assert.ok(!storedAfterMerge.article.body.includes('仍未提交'),
+        '列表合并只读取/合并数据，绝不能把未提交内容保存上去');
+
+      // 版本基准仍是版本 2：再保存应更新为版本 3，而不是误报 409。
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '修改已保存', 'ok');
+      const stored = await (await server.api(`/api/articles/${bannerId}`)).json();
+      assert.equal(stored.article.version, 3);
+      assert.equal(stored.article.title, '第二版标题');
+      assert.ok(stored.article.body.includes('又补写了一段、列表到达时仍未提交'));
+      assert.equal((await server.listArticles()).length, 1);
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 17. The initial list fetch fails after a draft was saved successfully on
+//     this page: the saved card stays usable, the page clearly distinguishes
+//     "list load failed" from "no drafts", never frames the save as failed,
+//     and the card can still be opened for editing. Network failure carries
+//     its concrete reason too.
+// ---------------------------------------------------------------------------
+test('首次列表读取失败但本页面已保存草稿：保留卡片与成功状态、说明列表不完整、仍可打开编辑', async (browser) => {
+  for (const failMode of ['500', 'network']) {
+    const server = await TestServer.start();
+    try {
+      const page = await ui.openWithListHeld(browser, server.url, { fail: failMode });
+      try {
+        await ui.fill(page, { title: '失败前已保存', summary: '不会丢的摘要', body: '不会丢的正文' });
+        await ui.clickSave(page);
+        await ui.waitForStatus(page, '草稿已保存', 'ok');
+        let s = await ui.state(page);
+        assert.equal(s.listCount, 1);
+
+        await ui.releaseList(page);
+        await ui.waitListBusy(page, false);
+        s = await ui.state(page);
+        // 已保存的卡片仍然保留，且仍可打开。
+        assert.equal(s.listCount, 1);
+        assert.equal(s.cards[0].title, '失败前已保存');
+        assert.equal(s.cards[0].summary, '不会丢的摘要');
+        // 明确说明列表加载失败、已有保存结果仍保留；不显示“没有草稿”。
+        assert.equal(s.listNoticeHidden, false);
+        assert.match(s.listNotice, /草稿列表加载失败/);
+        assert.match(s.listNotice, /完整列表尚未取得/);
+        assert.match(s.listNotice, /已经保存成功/);
+        assert.ok(!s.listNotice.includes('还没有保存的草稿'));
+        assert.equal(s.emptyTip, '');
+        if (failMode === '500') assert.match(s.listNotice, /文章列表暂时不可用/);
+        else assert.match(s.listNotice, /网络连接中断/);
+        // 表单区的成功提示不能被列表失败改写成保存失败。
+        assert.match(s.statusText, /草稿已保存/);
+        assert.equal(s.statusKind, 'ok');
+
+        // 已有卡片仍可正常打开编辑。
+        await ui.clickEdit(page, '失败前已保存');
+        await ui.waitLoadedDraft(page);
+        s = await ui.state(page);
+        assert.equal(s.form.title, '失败前已保存');
+        assert.equal(s.form.body, '不会丢的正文');
+        assert.equal(s.cards[0].editing, true);
+      } finally {
+        ui.assertNoPageErrors(page);
+        await browser.closePage(page);
+        await server.stop();
+      }
+    } catch (error) {
+      await server.stop();
+      throw error;
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 18. The initial list fetch fails and nothing was saved on this page: show
+//     the real failure reason, never the "no drafts" success message. Saving
+//     afterwards still works and the new draft appears.
+// ---------------------------------------------------------------------------
+test('首次列表读取失败且本页面无保存：只显示真实失败原因，不显示空列表提示；之后仍可新建', async (browser) => {
+  for (const failMode of ['500', 'network']) {
+    const server = await TestServer.start();
+    try {
+      const page = await ui.openWithListHeld(browser, server.url, { fail: failMode });
+      try {
+        assert.equal((await ui.state(page)).listCount, 0);
+        await ui.releaseList(page);
+        await ui.waitListBusy(page, false);
+        let s = await ui.state(page);
+        assert.equal(s.listCount, 0);
+        assert.equal(s.listNoticeHidden, false);
+        assert.match(s.listNotice, /草稿列表加载失败/);
+        assert.ok(!s.listNotice.includes('还没有保存的草稿'));
+        assert.ok(!s.listNotice.includes('已经保存成功'));
+        assert.equal(s.emptyTip, '', '不能把加载失败显示成空列表');
+        if (failMode === '500') assert.match(s.listNotice, /文章列表暂时不可用/);
+        else assert.match(s.listNotice, /网络连接中断/);
+
+        // 失败之后新建仍正常（保存请求不受列表读取影响）。
+        await ui.fill(page, { title: '失败后新建', body: '正文' });
+        await ui.clickSave(page);
+        await ui.waitForStatus(page, '草稿已保存', 'ok');
+        s = await ui.state(page);
+        assert.equal(s.listCount, 1);
+        assert.equal(s.cards[0].title, '失败后新建');
+        assert.equal((await server.listArticles()).length, 1);
+      } finally {
+        ui.assertNoPageErrors(page);
+        await browser.closePage(page);
+        await server.stop();
+      }
+    } catch (error) {
+      await server.stop();
+      throw error;
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+
 const only = tests.filter((t) => process.env.TEST_FILTER && t.name.includes(process.env.TEST_FILTER));
 const selected = only.length ? only : tests;
 
