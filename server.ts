@@ -256,6 +256,13 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     if (isDirty() && !window.confirm('当前表单有未保存的修改，打开另一篇草稿将放弃这些输入。确定继续吗？')) {
       return;
     }
+    // 记录开始读取时的表单快照。读取期间表单仍可继续输入，
+    // 成功返回时据此判断是否有等待期间的新修改需要用户明确取舍。
+    var snapshot = {
+      title: titleInput.value,
+      summary: summaryInput.value,
+      body: bodyInput.value
+    };
     setSaving(true, '读取中…');
     setStatus('正在读取草稿内容…', null);
     fetch('/api/articles/' + encodeURIComponent(id), { headers: { accept: 'application/json' } })
@@ -270,7 +277,23 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       .then(function (article) {
         setSaving(false);
         // 正文必须来自单篇接口，绝不使用列表里的摘要充当正文
-        applyEditingState(article);
+        if (titleInput.value === snapshot.title
+          && summaryInput.value === snapshot.summary
+          && bodyInput.value === snapshot.body) {
+          // 等待期间没有新修改（改动后又恢复原值也不算）：照常载入目标草稿
+          applyEditingState(article);
+          return;
+        }
+        // 等待期间有了新输入：绝不能直接回填覆盖。在用户明确选择之前，
+        // 三个字段原样保留，表单仍处原先的新建或编辑原草稿状态，
+        // 绝不把当前输入关联到目标文章。
+        if (window.confirm('目标草稿已读取完成，但等待期间你又修改了标题、摘要或正文。'
+          + '打开目标草稿将放弃这些新修改。\n\n'
+          + '点击“确定”放弃新修改并打开目标草稿；点击“取消”保留当前输入，继续原来的操作。')) {
+          applyEditingState(article);
+        } else {
+          setStatus('已保留当前输入，未打开目标草稿。', null);
+        }
       })
       .catch(function (err) {
         setSaving(false);
