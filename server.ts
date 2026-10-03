@@ -26,7 +26,7 @@ button.secondary{background:#fff;color:#175b9c;margin-left:.6rem}
 button:disabled{opacity:.55;cursor:default}
 button.danger{border-color:#c0392b;background:#fff;color:#c0392b}
 .status{margin:.8rem 0 0;min-height:1.4em}
-.status.ok{color:#1a7f37}.status.err{color:#c0392b}
+.status.ok{color:#1a7f37}.status.err{color:#c0392b}.status.warn{color:#8a5a00}
 .edit-banner{margin:0 0 .25rem;padding:.6rem .8rem;border-radius:6px;background:#eef4fb;border:1px solid #b6d2ee;color:#14467a;font-size:.92rem}
 .edit-banner code{background:#dde9f6;padding:0 .3rem;border-radius:3px}
 .edit-banner .meta{color:#3d6391;font-size:.85rem;margin-top:.2rem}
@@ -383,10 +383,16 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     }
     hideConflict();
     var isEdit = !!editing;
-    var payload = {
+    // 快照本次提交的内容：响应返回时按字段对比，等待期间新输入的内容不被覆盖
+    var submitted = {
       title: titleInput.value,
       summary: summaryInput.value,
       body: bodyInput.value
+    };
+    var payload = {
+      title: submitted.title,
+      summary: submitted.summary,
+      body: submitted.body
     };
     var url = '/api/articles';
     if (isEdit) {
@@ -432,12 +438,20 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           render();
           setSaving(false);
           // 保持编辑态：仍是同一篇草稿，可继续修改
-          applyEditingStateSilent(article, '修改已保存。文章标识、创建时间与草稿状态均未改变。');
+          applySavedEdit(article, submitted);
         } else {
           articles.push(article);
           render();
           setSaving(false);
-          enterCreateMode('草稿已保存。可以继续新建草稿。', 'ok');
+          // 等待响应期间表单可能又被输入：只有内容仍与本次提交一致时才清空，
+          // 否则保留新输入，仅确认本次提交已保存
+          if (titleInput.value === submitted.title
+            && summaryInput.value === submitted.summary
+            && bodyInput.value === submitted.body) {
+            enterCreateMode('草稿已保存。可以继续新建草稿。', 'ok');
+          } else {
+            setStatus('草稿已保存。表单中随后输入的内容尚未保存，可继续修改后再次点击“保存草稿”。', 'warn');
+          }
         }
       })
       .catch(function (err) {
@@ -448,12 +462,20 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       });
   });
 
-  // 保存成功后留在编辑态：表单同步为服务端保存的规范内容（标题已去首尾空白），
-  // 本地基准版本一并更新，不清空输入。
-  function applyEditingStateSilent(article, message) {
-    titleInput.value = article.title == null ? '' : String(article.title);
-    summaryInput.value = article.summary == null ? '' : String(article.summary);
-    bodyInput.value = article.body == null ? '' : String(article.body);
+  // 保存成功后留在编辑态：本地基准更新为服务端返回的已保存内容与版本，
+  // 不清空输入。等待响应期间用户可能继续修改：只有自提交后未再改动的字段
+  // 才同步为已保存内容（标题已去首尾空白），后来修改的字段完整保留当前输入，
+  // 并明确提示本次提交已保存、当前仍有未保存修改。
+  function applySavedEdit(article, submitted) {
+    if (titleInput.value === submitted.title) {
+      titleInput.value = article.title == null ? '' : String(article.title);
+    }
+    if (summaryInput.value === submitted.summary) {
+      summaryInput.value = article.summary == null ? '' : String(article.summary);
+    }
+    if (bodyInput.value === submitted.body) {
+      bodyInput.value = article.body == null ? '' : String(article.body);
+    }
     editing = {
       id: article.id,
       title: article.title,
@@ -468,7 +490,11 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     cancelBtn.hidden = false;
     saveBtn.textContent = '保存修改';
     hideConflict();
-    setStatus(message, 'ok');
+    if (isDirty()) {
+      setStatus('本次提交的内容已保存，但当前表单还有未保存的修改；再次点击“保存修改”即可保存。文章标识、创建时间与草稿状态均未改变。', 'warn');
+    } else {
+      setStatus('修改已保存。文章标识、创建时间与草稿状态均未改变。', 'ok');
+    }
     render();
   }
 
