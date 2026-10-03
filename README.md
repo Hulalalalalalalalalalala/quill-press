@@ -43,6 +43,14 @@ node server.ts serve --host 127.0.0.1 --port 8080 --data-dir data
 
 旧数据目录完全兼容：由旧版本保存、没有 `version` 字段的草稿在读取时按版本 `0` 处理，可直接打开并编辑保存（首次更新后变为版本 `1`），不需要重新创建文章。
 
+## 自动化测试
+
+回归测试通过 Chrome DevTools Protocol 驱动真实浏览器打开首页，覆盖保存等待期间继续输入、再次保存、重新打开草稿以及服务端拒绝保存等场景。需要本机安装 Chrome（可用 `CHROME_BIN` 环境变量指定路径），不需要安装其他 npm 包。
+
+```sh
+npm test
+```
+
 ```sh
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/api/articles
