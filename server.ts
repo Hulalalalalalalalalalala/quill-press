@@ -698,24 +698,50 @@ function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let tooLarge = false;
     let settled = false;
+    // A declared Content-Length already tells us the request will exceed the
+    // limit, but we must still consume the whole request before responding;
+    // skip buffering from the start to bound memory use while draining.
+    const declaredLength = Number(req.headers['content-length']);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
+      tooLarge = true;
+    }
     req.on('data', (chunk: unknown) => {
       if (settled) return;
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      if (tooLarge) return; // draining the remainder; nothing left to buffer
       size += buf.length;
       if (size > MAX_BODY_BYTES) {
-        settled = true;
-        reject(new HttpError(400, 'request body is too large'));
-        req.destroy();
+        // Keep reading (and discarding) the rest of the request instead of
+        // calling req.destroy(): destroying the socket resets the connection
+        // while the client is still sending, so it would never receive the
+        // 400 response (only a network failure). The full request is drained,
+        // then the rejection below produces a complete, readable response.
+        tooLarge = true;
+        chunks.length = 0;
         return;
       }
       chunks.push(buf);
     });
     req.on('end', () => {
-      if (!settled) resolve(Buffer.concat(chunks).toString('utf8'));
+      if (settled) return;
+      settled = true;
+      if (tooLarge) {
+        reject(new HttpError(400, `request body exceeds the allowed size of ${MAX_BODY_BYTES} bytes`));
+        return;
+      }
+      resolve(Buffer.concat(chunks).toString('utf8'));
     });
     req.on('error', (error: Error) => {
-      if (!settled) reject(new HttpError(400, `could not read request body: ${error.message}`));
+      if (settled) return;
+      settled = true;
+      reject(new HttpError(400, `could not read request body: ${error.message}`));
+    });
+    req.on('aborted', () => {
+      if (settled) return;
+      settled = true;
+      reject(new HttpError(400, 'request body was not fully received'));
     });
   });
 }
@@ -869,7 +895,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
 const server = createServer((req: IncomingMessage, res: ServerResponse): void => {
   handle(req, res).catch((error: unknown) => {
-    if (res.writableEnded) return;
+    if (res.writableEnded || res.destroyed) return;
     if (error instanceof HttpError) {
       const payload: { error: string; article?: Article } = { error: error.message };
       const withArticle = error as HttpError & { article?: Article };
