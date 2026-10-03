@@ -256,6 +256,14 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     if (isDirty() && !window.confirm('当前表单有未保存的修改，打开另一篇草稿将放弃这些输入。确定继续吗？')) {
       return;
     }
+    // 记录“开始读取时”三个字段的原值。等待读取期间输入框始终可用，
+    // 成功后按此快照判断等待期间是否产生了新修改；在此之前不改动 editing、
+    // 表单模式与列表标记，避免等待期间的输入被误当作目标草稿的修改。
+    var snapshot = {
+      title: titleInput.value,
+      summary: summaryInput.value,
+      body: bodyInput.value
+    };
     setSaving(true, '读取中…');
     setStatus('正在读取草稿内容…', null);
     fetch('/api/articles/' + encodeURIComponent(id), { headers: { accept: 'application/json' } })
@@ -268,14 +276,40 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
         });
       })
       .then(function (article) {
+        // 逐字段对比开始读取时的快照：改过又恢复原值的字段不算新修改，
+        // 三个字段都恢复时照常打开；清空摘要或正文同样属于修改。
+        var changedLabels = [];
+        if (titleInput.value !== snapshot.title) changedLabels.push('标题');
+        if (summaryInput.value !== snapshot.summary) changedLabels.push('摘要');
+        if (bodyInput.value !== snapshot.body) changedLabels.push('正文');
+        if (changedLabels.length > 0) {
+          // 选择之前三个字段原样保留，editing 仍指向原草稿（或仍处于新建状态），
+          // 不会发起任何保存，也不会把目标草稿标记为编辑中。
+          var discard = window.confirm(
+            '目标草稿已读取成功，但等待读取期间' + changedLabels.join('、')
+            + '又有了新的未保存修改（包括清空内容）。打开该草稿会放弃这些输入。\n\n'
+            + '选择“确定”放弃当前输入并打开目标草稿；选择“取消”保留当前输入，继续原来的'
+            + (editing ? '编辑' : '新建') + '。');
+          if (!discard) {
+            // 保留当前输入：字段、编辑状态、表单模式与列表标记全部维持原样。
+            setSaving(false);
+            saveBtn.textContent = editing ? '保存修改' : '保存草稿';
+            setStatus('已保留等待期间补写的内容，目标草稿未打开，可以继续'
+              + (editing ? '编辑当前草稿。' : '新建草稿。'), 'warn');
+            return;
+          }
+        }
         setSaving(false);
         // 正文必须来自单篇接口，绝不使用列表里的摘要充当正文
         applyEditingState(article);
       })
       .catch(function (err) {
+        // 读取失败：保留全部当前输入与原来的编辑状态，恢复可操作状态，
+        // 不调用 render()，目标草稿不会被标记为编辑中。
         setSaving(false);
         saveBtn.textContent = editing ? '保存修改' : '保存草稿';
-        setStatus('打开草稿失败：' + (err && err.message ? err.message : err) + '，可稍后重试。', 'err');
+        setStatus('打开草稿失败：' + (err && err.message ? err.message : err)
+          + '，当前输入与编辑状态均已保留，可稍后重试。', 'err');
       });
   }
 
