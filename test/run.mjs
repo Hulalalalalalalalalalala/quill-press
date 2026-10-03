@@ -4,6 +4,12 @@
 // falsely reported as saved. Scenarios exercise the real form, status text,
 // draft list, a second save and reopening the draft — never just the API.
 //
+// A second covered race concerns the very first list read: if a save on this
+// page succeeds before the initial list result arrives, the late (pre-save)
+// snapshot must not wipe the saved draft; the page merges the late result
+// with its own confirmed saves by id, keeps editing state untouched, and on
+// list-read failure keeps the saved drafts while saying the LIST failed.
+//
 // Run: node test/run.mjs   (CHROME_BIN can override the browser executable)
 import assert from 'node:assert/strict';
 import { Browser } from './cdp.mjs';
@@ -1046,6 +1052,221 @@ test('载入读取返回404/500/网络失败：显示具体原因、保留响应
     assert.equal((await server.listArticles()).length, 1);
   } finally {
     await closeContext(ctx, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 14. First list read loses the race: the save succeeds first, then the list
+//     snapshot from BEFORE the save arrives. The saved draft must not
+//     disappear and the “还没有保存的草稿” placeholder must not come back.
+// ---------------------------------------------------------------------------
+test('首次列表结果迟到（保存前快照为空）：本页面已保存的草稿不消失，也不显示空列表提示', async (browser) => {
+  const server = await TestServer.start();
+  const page = await ui.openHoldingList(browser, server.url);
+  try {
+    await ui.waitListParked(page, 1);
+    // 列表请求此刻到达服务器：快照为空（保存之前的状态），响应继续扣留。
+    await ui.releaseListRequests(page);
+    await ui.waitListAnswered(page, 1);
+
+    // 列表加载期间正常新建草稿并保存成功。
+    await ui.fill(page, { title: '抢先保存的草稿', summary: '抢先摘要', body: '抢先正文\n\n第二段' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '草稿已保存', 'ok');
+    let s = await ui.state(page);
+    assert.equal(s.listCount, 1);
+    assert.equal(s.cards[0].title, '抢先保存的草稿');
+    assert.deepEqual(s.form, { title: '', summary: '', body: '' });
+
+    // 迟到的首次列表结果（保存前的空快照）到达：已保存的草稿不能消失。
+    await ui.deliverListResponses(page);
+    await ui.settlePage(page);
+    s = await ui.state(page);
+    assert.equal(s.listCount, 1);
+    assert.equal(s.cards[0].title, '抢先保存的草稿');
+    assert.equal(s.cards[0].summary, '抢先摘要');
+    assert.equal(s.emptyTip, ''); // 不是“还没有保存的草稿”，也没有失败提示
+    assert.deepEqual(s.form, { title: '', summary: '', body: '' });
+    assert.equal(s.saveBtnText, '保存草稿');
+    const stored = await server.listArticles();
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0].title, '抢先保存的草稿');
+  } finally {
+    await closeContext({ server, page }, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 15. The late list brings back another session's draft AND an older version
+//     of the draft this page just re-saved: both drafts show (same title,
+//     different ids stay two records), the locally saved newer content does
+//     not regress, and the form/editing state/version baseline are untouched.
+// ---------------------------------------------------------------------------
+test('迟到列表带回其他草稿和本页文章的旧版本：合并显示、本地新内容不退回、编辑态与表单不受影响', async (browser) => {
+  const server = await TestServer.start();
+  // 另一会话已存在的草稿，标题与本页面稍后要改成的标题相同（标识不同）。
+  const other = await seed(server, { title: '同名草稿', summary: '其他会话的摘要', body: '其他会话的正文' });
+  const page = await ui.openHoldingList(browser, server.url);
+  try {
+    await ui.waitListParked(page, 1);
+
+    // 列表加载期间新建并保存一篇草稿。
+    await ui.fill(page, { title: '本页新草稿', summary: '首版摘要', body: '首版正文' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '草稿已保存', 'ok');
+
+    // 此刻放行列表请求：快照包含其他草稿和本页草稿的第一版。
+    await ui.releaseListRequests(page);
+    await ui.waitListAnswered(page, 1);
+
+    // 快照生成后，本页面又打开这篇草稿并保存了修改（版本 2）。
+    await ui.clickEdit(page, '本页新草稿');
+    await ui.waitLoadedDraft(page);
+    await ui.fill(page, { title: '同名草稿', summary: '第二版摘要', body: '第二版正文' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '修改已保存', 'ok');
+    const mine = (await server.listArticles()).find((a) => a.id !== other.id);
+    assert.equal(mine.version, 2);
+
+    // 迟到的列表结果到达：仍带着本页草稿较早的标题、摘要和版本。
+    await ui.deliverListResponses(page);
+    await page.waitFor('function(){return __snap().listCount===2;}',
+      { label: 'merged list shows both drafts' });
+    const s = await ui.state(page);
+    assert.equal(s.listCount, 2);
+    // 按创建时间倒序：本页草稿（较新）在前；标题相同但标识不同仍是两条记录。
+    assert.equal(s.cards[0].title, '同名草稿');
+    assert.equal(s.cards[0].summary, '第二版摘要'); // 不退回迟到结果里的旧内容
+    assert.equal(s.cards[0].editing, true); // 正在编辑的卡片仍标记“编辑中”
+    assert.equal(s.cards[1].title, '同名草稿');
+    assert.equal(s.cards[1].summary, '其他会话的摘要'); // 读取带回的草稿不丢
+    assert.equal(s.cards[1].editing, false);
+    // 没有重复卡片，也没有旧标题残留。
+    assert.ok(!s.cards.some((c) => c.title === '本页新草稿'));
+    // 表单输入、编辑对象与版本基准不受列表更新影响。
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerId, mine.id);
+    assert.deepEqual(s.form, { title: '同名草稿', summary: '第二版摘要', body: '第二版正文' });
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.emptyTip, '');
+
+    // 后续保存仍更新同一篇（版本基准未被列表读取改动），不产生新记录。
+    await ui.fill(page, { body: '第二版正文\n\n列表到达后再补充' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '修改已保存', 'ok');
+    const stored = await getArticle(server, mine.id);
+    assert.equal(stored.version, 3);
+    assert.equal(stored.body, '第二版正文\n\n列表到达后再补充');
+    assert.equal((await server.listArticles()).length, 2);
+    const after = await ui.state(page);
+    assert.equal(after.listCount, 2);
+    assert.equal(after.bannerId, mine.id);
+  } finally {
+    await closeContext({ server, page }, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 16. The late list already contains the draft this page just saved (same
+//     version): it must appear exactly once, not duplicated.
+// ---------------------------------------------------------------------------
+test('迟到的首次列表已包含本页面刚保存的文章：只显示一条，不出现重复卡片', async (browser) => {
+  const server = await TestServer.start();
+  const page = await ui.openHoldingList(browser, server.url);
+  try {
+    await ui.waitListParked(page, 1);
+    await ui.fill(page, { title: '唯一草稿', summary: '唯一摘要', body: '唯一正文' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '草稿已保存', 'ok');
+    // 列表请求在保存之后到达服务器：快照已包含这篇草稿；响应随后才交付。
+    await ui.releaseListRequests(page);
+    await ui.waitListAnswered(page, 1);
+    await ui.deliverListResponses(page);
+    await ui.settlePage(page);
+    const s = await ui.state(page);
+    assert.equal(s.listCount, 1);
+    assert.equal(s.cards[0].title, '唯一草稿');
+    assert.equal(s.cards[0].summary, '唯一摘要');
+    assert.equal(s.emptyTip, '');
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await closeContext({ server, page }, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 17. The first list read ultimately fails after this page saved a draft:
+//     the saved card stays, the notice clearly says the LIST failed to load
+//     (not that the save failed) and that saved drafts are kept; the card
+//     can still be opened for editing.
+// ---------------------------------------------------------------------------
+test('首次列表读取最终失败：保留本页面已保存的草稿并明确提示，卡片仍可正常打开编辑', async (browser) => {
+  const server = await TestServer.start();
+  const page = await ui.openHoldingList(browser, server.url);
+  try {
+    await ui.waitListParked(page, 1);
+    await ui.fill(page, { title: '失败前保存的草稿', summary: '保留摘要', body: '保留正文' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '草稿已保存', 'ok');
+
+    // 首次列表读取以失败告终。
+    await ui.armListFailure(page, 500);
+    await ui.releaseListRequests(page);
+    await ui.deliverListResponses(page);
+    await page.waitFor(
+      'function(){return document.getElementById("empty-tip").textContent.includes("草稿列表加载失败");}',
+      { label: 'list failure notice' });
+
+    let s = await ui.state(page);
+    // 已保存并显示的草稿保留；明确说明列表加载失败、已有保存结果仍保留。
+    assert.equal(s.listCount, 1);
+    assert.equal(s.cards[0].title, '失败前保存的草稿');
+    assert.match(s.emptyTip, /草稿列表加载失败/);
+    assert.match(s.emptyTip, /仍保留/);
+    assert.equal(await page.eval(`document.getElementById('empty-tip').className`), 'empty err');
+    // 失败提示不能把成功保存说成保存失败：表单状态仍是保存成功提示。
+    assert.equal(s.statusKind, 'ok');
+    assert.match(s.statusText, /草稿已保存/);
+    assert.ok(!s.statusText.includes('保存失败'));
+
+    // 已有卡片仍可正常打开编辑。
+    await ui.clickEdit(page, '失败前保存的草稿');
+    await ui.waitLoadedDraft(page);
+    s = await ui.state(page);
+    const stored = (await server.listArticles())[0];
+    assert.equal(s.bannerId, stored.id);
+    assert.deepEqual(s.form, { title: '失败前保存的草稿', summary: '保留摘要', body: '保留正文' });
+    assert.equal(s.cards[0].editing, true);
+    // 列表仍不完整：失败提示在打开编辑后依然保留。
+    assert.match(s.emptyTip, /草稿列表加载失败/);
+  } finally {
+    await closeContext({ server, page }, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 18. The first list read fails and this page never saved anything: show the
+//     real failure reason, not the empty-list placeholder.
+// ---------------------------------------------------------------------------
+test('首次列表读取失败且本页面没有保存过文章：显示真实失败原因，不显示空列表提示', async (browser) => {
+  const server = await TestServer.start();
+  const page = await ui.openHoldingList(browser, server.url);
+  try {
+    await ui.waitListParked(page, 1);
+    await ui.armListFailure(page, 'network');
+    await ui.releaseListRequests(page);
+    await ui.deliverListResponses(page);
+    await page.waitFor(
+      'function(){return document.getElementById("empty-tip").textContent.includes("草稿列表加载失败");}',
+      { label: 'list failure notice' });
+    const s = await ui.state(page);
+    assert.equal(s.listCount, 0);
+    assert.match(s.emptyTip, /草稿列表加载失败/);
+    assert.match(s.emptyTip, /网络连接中断/);
+    assert.ok(!s.emptyTip.includes('还没有保存的草稿'));
+    assert.deepEqual(await server.listArticles(), []);
+  } finally {
+    await closeContext({ server, page }, browser);
   }
 });
 

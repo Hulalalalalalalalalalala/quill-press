@@ -7,10 +7,15 @@
 // independent gates on window.fetch:
 //   - save gate: holds POST/PUT /api/articles calls until the test releases;
 //   - read gate: holds GET /api/articles/:id calls (the single-article read
-//     used by “编辑” and by the post-conflict “载入最新内容” button).
-// The list fetch always passes through untouched. A one-shot failure arm can
-// also make the next single-article read fail (404/500/network) without any
-// test-only branch in the product.
+//     used by “编辑” and by the post-conflict “载入最新内容” button);
+//   - list gate: parks GET /api/articles (the homepage list read) in two
+//     stages — the request is released so the server snapshots its state at a
+//     chosen moment, and the response is delivered later — so the race “save
+//     returns first, the pre-save list snapshot arrives afterwards” is
+//     reproduced deterministically. It can also fail the list read once.
+// The list gate is off unless the page was opened with openHoldingList.
+// A one-shot failure arm can also make the next single-article read fail
+// (404/500/network) without any test-only branch in the product.
 //
 // window.confirm is replaced by a controllable double (accept/cancel/native),
 // because the reload flow asks the user to choose between keeping the current
@@ -22,6 +27,17 @@ const INIT_SOURCE = `(function () {
   var readGate = { enabled: false, hits: 0, pending: [] };
   // null = off; 404/500 = respond with that status once; 'network' = reject once.
   var failNextRead = null;
+  // List gate: requests park in the requests queue; releaseList() issues the
+  // real fetch (the server snapshots its state at that moment) and parks the
+  // outcome in the responses queue; deliverList() then hands it to the page.
+  // The answered counter tracks settled outcomes so tests can wait for the
+  // server to have produced the snapshot before saving again.
+  var listGate = {
+    enabled: !!window.__qtestHoldList,
+    hits: 0, requests: [], responses: [], answered: 0
+  };
+  // null = off; 404/500 = respond with that status once; 'network' = reject once.
+  var failNextList = null;
 
   function methodOf(init) { return ((init && init.method) || 'GET').toUpperCase(); }
   function pathOf(input) {
@@ -34,6 +50,9 @@ const INIT_SOURCE = `(function () {
   }
   function isItemRead(path, method) {
     return method === 'GET' && /^\\/api\\/articles\\/[^/]+$/.test(path);
+  }
+  function isListRead(path, method) {
+    return method === 'GET' && path === '/api/articles';
   }
   function hold(gate, input, init) {
     gate.hits++;
@@ -64,6 +83,36 @@ const INIT_SOURCE = `(function () {
     return origFetch(input, init);
   }
 
+  function listFailure(mode) {
+    if (mode === 'network') return Promise.reject(new Error('模拟的列表网络连接中断'));
+    return Promise.resolve(new Response(
+      JSON.stringify({ error: '模拟失败：列表读取暂时不可用' }),
+      { status: mode, headers: { 'content-type': 'application/json' } }));
+  }
+  // The list read parks before the request is even sent. releaseList() sends
+  // it (or consumes an armed failure) and parks the outcome; deliverList()
+  // resolves the page-visible promise. Splitting the two lets a test save a
+  // draft after the server produced its (pre-save) snapshot but before the
+  // page receives it — the exact race the homepage must survive.
+  function parkListRead(input, init) {
+    listGate.hits++;
+    return new Promise(function (resolve, reject) {
+      listGate.requests.push(function () {
+        var outcome = failNextList !== null
+          ? listFailure(failNextList)
+          : origFetch(input, init);
+        failNextList = null;
+        outcome.then(
+          function () { listGate.answered++; },
+          function () { listGate.answered++; });
+        // The held outcome is only delivered by deliverList(); swallow
+        // rejections until then so a parked failure stays unobserved.
+        outcome.catch(function () {});
+        listGate.responses.push(function () { outcome.then(resolve, reject); });
+      });
+    });
+  }
+
   window.fetch = function (input, init) {
     var path = pathOf(input);
     var method = methodOf(init);
@@ -77,6 +126,7 @@ const INIT_SOURCE = `(function () {
       return runItemRead(input, init);
     }
     if (saveGate.enabled && isSaveCall(path, method)) return hold(saveGate, input, init);
+    if (listGate.enabled && isListRead(path, method)) return parkListRead(input, init);
     return origFetch(input, init);
   };
 
@@ -143,6 +193,29 @@ const INIT_SOURCE = `(function () {
     readGateState: function () { return gateView(readGate); },
     armReadFailure: function (mode) { failNextRead = mode; },
     readFailureArmed: function () { return failNextRead; },
+    releaseList: function () {
+      var queued = listGate.requests;
+      listGate.requests = [];
+      queued.forEach(function (send) { send(); });
+      return queued.length;
+    },
+    deliverList: function () {
+      var queued = listGate.responses;
+      listGate.responses = [];
+      queued.forEach(function (deliver) { deliver(); });
+      return queued.length;
+    },
+    listGateState: function () {
+      return {
+        enabled: listGate.enabled,
+        hits: listGate.hits,
+        requests: listGate.requests.length,
+        responses: listGate.responses.length,
+        answered: listGate.answered
+      };
+    },
+    armListFailure: function (mode) { failNextList = mode; },
+    listFailureArmed: function () { return failNextList; },
     confirmMode: function (mode) { confirmBox.mode = mode; },
     confirmReset: function () { confirmBox.calls = []; },
     confirmState: function () {
@@ -193,23 +266,39 @@ const INIT_SOURCE = `(function () {
   };
 })();`;
 
-export async function open(browser, baseUrl) {
-  const page = await browser.newPage();
-  await page.enable();
-  await page.addInitScript(INIT_SOURCE);
-  await page.goto(baseUrl);
-  // Initial list fetch has settled.
+// The initial list read has settled (success or failure — both replace the
+// “加载中” placeholder; a failure message never contains that substring).
+export async function waitListSettled(page) {
   await page.waitFor(
     'function(){return !document.getElementById("empty-tip").textContent.includes("加载中");}',
-    { label: 'initial draft list settled' });
+    { label: 'draft list settled' });
+}
+
+async function openPage(browser, baseUrl, holdList) {
+  const page = await browser.newPage();
+  await page.enable();
+  // Arms the list gate before the page's own scripts run, so the very first
+  // list read is parked. Init scripts run in order of registration.
+  if (holdList) await page.addInitScript('window.__qtestHoldList = true;');
+  await page.addInitScript(INIT_SOURCE);
+  await page.goto(baseUrl);
+  if (!holdList) await waitListSettled(page);
   return page;
+}
+
+export function open(browser, baseUrl) {
+  return openPage(browser, baseUrl, false);
+}
+
+// Opens the homepage with the initial list read parked in the list gate:
+// the page shows “草稿加载中…” until the test releases and delivers it.
+export function openHoldingList(browser, baseUrl) {
+  return openPage(browser, baseUrl, true);
 }
 
 export async function reload(page) {
   await page.reload();
-  await page.waitFor(
-    'function(){return !document.getElementById("empty-tip").textContent.includes("加载中");}',
-    { label: 'draft list settled after reload' });
+  await waitListSettled(page);
 }
 
 export async function fill(page, fields) {
@@ -260,6 +349,46 @@ export async function armReadFailure(page, mode) {
 }
 export function readFailureArmed(page) {
   return page.eval(`__qtest.readFailureArmed()`);
+}
+
+// List gate (GET /api/articles): releaseList sends parked requests so the
+// server snapshots its state at that moment; deliverList hands the parked
+// responses to the page.
+export async function releaseListRequests(page) { return page.eval(`__qtest.releaseList()`); }
+export async function deliverListResponses(page) { return page.eval(`__qtest.deliverList()`); }
+export function listGateState(page) { return page.eval(`__qtest.listGateState()`); }
+
+// Make the next list read fail once when its request is released: 404, 500
+// or 'network'.
+export async function armListFailure(page, mode) {
+  await page.eval(`__qtest.armListFailure(${JSON.stringify(mode)})`);
+}
+
+// The initial list read is parked in the gate (page still shows “加载中”).
+export async function waitListParked(page, count = 1) {
+  await page.waitFor(
+    `function(){var g=__qtest.listGateState();return g.requests===${count}
+      && document.getElementById('empty-tip').textContent.includes('加载中');}`,
+    { timeout: 5000, label: `list read #${count} parked while page shows 加载中` });
+}
+
+// The released list request has been answered by the server (its snapshot is
+// fixed) and the response is parked awaiting delivery.
+export async function waitListAnswered(page, count = 1) {
+  await page.waitFor(
+    `function(){var g=__qtest.listGateState();return g.answered===${count} && g.responses===${count};}`,
+    { timeout: 5000, label: `list response #${count} answered and parked` });
+}
+
+// Waits a few task turns so the page finishes processing a just-delivered
+// list response whose correct visible outcome may be identical to the prior
+// state (e.g. a stale empty snapshot must leave the saved draft untouched).
+export async function settlePage(page) {
+  await page.eval(`new Promise(function (resolve) {
+    var turns = 0;
+    function next() { if (++turns >= 6) resolve(true); else setTimeout(next, 0); }
+    next();
+  })`);
 }
 
 // Control the page's window.confirm double.

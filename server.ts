@@ -107,6 +107,13 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
   var editing = null;
   // 冲突对照区当前的操作按钮，读取最新内容期间需暂时禁用
   var conflictActionButtons = [];
+  // 本页面已成功保存（新建或修改）的草稿：键为文章标识，值为服务端确认的最新
+  // 已保存内容。首次列表读取可能带着保存前的旧结果迟到，合并时以此为准，
+  // 绝不让本页面已保存成功的文章被旧列表覆盖而消失或退回旧内容。
+  var savedLocally = {};
+  // 首次列表读取的失败原因（null = 未失败）。用于区分“没有草稿”和
+  // “尚未取得完整列表”：失败时本页面已保存的草稿仍保留，并明确提示是列表加载失败。
+  var listLoadError = null;
 
   function setStatus(text, kind) {
     statusEl.textContent = text || '';
@@ -173,7 +180,45 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       li.appendChild(card);
       listEl.appendChild(li);
     });
-    setEmpty(sorted.length === 0 ? '还没有保存的草稿。' : '');
+    if (listLoadError) {
+      // 列表加载失败（不是保存失败）：本页面已保存成功的草稿仍保留在上方，
+      // 明确区分“没有草稿”和“尚未取得完整列表”。
+      setEmpty(sorted.length === 0
+        ? '草稿列表加载失败：' + listLoadError
+        : '草稿列表加载失败：' + listLoadError
+          + '。本页面已保存成功的草稿仍保留在上方，但可能不是完整列表。', 'err');
+    } else {
+      setEmpty(sorted.length === 0 ? '还没有保存的草稿。' : '');
+    }
+  }
+  function versionOf(article) {
+    return article && typeof article.version === 'number' && isFinite(article.version)
+      ? article.version : 0;
+  }
+  // 记录本页面一次成功保存（新建或修改）后服务端确认的内容。
+  // 只记录服务端返回的已保存内容，绝不把表单里尚未提交的输入当作已保存。
+  function recordLocalSave(article) {
+    if (article && article.id != null) savedLocally[String(article.id)] = article;
+  }
+  // 把列表读取结果与本页面已成功保存的草稿按标识合并：读取带回的草稿全部保留；
+  // 本页面保存成功过的文章即使缺席于迟到的结果，或结果里仍是较早的标题、摘要、
+  // 版本，也以本页面已保存的最新内容为准；同一篇草稿只出现一次，
+  // 标题相同但标识不同的草稿仍是两条记录。
+  function mergeWithLocalSaves(fetched) {
+    var seen = {};
+    var merged = [];
+    fetched.forEach(function (article) {
+      if (!article || article.id == null) return;
+      var id = String(article.id);
+      if (seen[id]) return;
+      seen[id] = true;
+      var local = savedLocally[id];
+      merged.push(local && versionOf(local) >= versionOf(article) ? local : article);
+    });
+    Object.keys(savedLocally).forEach(function (id) {
+      if (!seen[id]) merged.push(savedLocally[id]);
+    });
+    return merged;
   }
   function load() {
     return fetch('/api/articles', { headers: { accept: 'application/json' } })
@@ -182,13 +227,20 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
         return r.json();
       })
       .then(function (data) {
-        articles = data && Array.isArray(data.articles) ? data.articles : [];
+        var fetched = data && Array.isArray(data.articles) ? data.articles : [];
+        // 首次结果可能生成于本页面保存成功之前：合并而不是覆盖——既不丢读取
+        // 带回的草稿，也不让本页面已保存成功的文章消失或退回旧内容。
+        // 只更新列表，绝不动表单当前输入、编辑对象与已取得的版本基准。
+        articles = mergeWithLocalSaves(fetched);
+        listLoadError = null;
         render();
       })
       .catch(function (err) {
-        articles = [];
-        listEl.textContent = '';
-        setEmpty('草稿列表加载失败：' + (err && err.message ? err.message : err), 'err');
+        // 列表读取失败：保留本页面已成功保存并显示的草稿，明确说明是列表
+        // 加载失败（不是保存失败）、当前显示的可能不是完整列表。
+        listLoadError = err && err.message ? err.message : String(err);
+        articles = mergeWithLocalSaves([]);
+        render();
       });
   }
 
@@ -524,6 +576,7 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
             if (articles[i] && articles[i].id === article.id) { idx = i; break; }
           }
           if (idx >= 0) articles[idx] = article; else articles.push(article);
+          recordLocalSave(article);
           render();
           setSaving(false);
           // 保持编辑态：仍是同一篇草稿，可继续修改。
@@ -534,6 +587,7 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           // 且未恢复为保存值，绝不能清空这些输入——把表单关联到刚创建的同一篇
           // 草稿进入编辑态，后续“保存修改”按本次响应的版本更新它，不再新建。
           articles.push(article);
+          recordLocalSave(article);
           setSaving(false);
           if (hasUnsavedAfterSave(article, submitted)) {
             mergeSavedEditingState(article, submitted, true);
