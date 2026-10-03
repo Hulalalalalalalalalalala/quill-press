@@ -694,28 +694,40 @@ function enqueueWrite<T>(task: () => T): Promise<T> {
   return run;
 }
 
+// Reads the whole request body. Bodies larger than MAX_BODY_BYTES are
+// rejected with a 400 — but only after the remaining bytes have been drained,
+// so the connection stays intact and the JSON error response reaches the
+// client completely (declared-length and chunked requests behave the same).
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let tooLarge = false;
     let settled = false;
     req.on('data', (chunk: unknown) => {
-      if (settled) return;
+      if (settled || tooLarge) return;
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
       size += buf.length;
       if (size > MAX_BODY_BYTES) {
-        settled = true;
-        reject(new HttpError(400, 'request body is too large'));
-        req.destroy();
+        tooLarge = true;
+        chunks.length = 0;
         return;
       }
       chunks.push(buf);
     });
     req.on('end', () => {
-      if (!settled) resolve(Buffer.concat(chunks).toString('utf8'));
+      if (settled) return;
+      settled = true;
+      if (tooLarge) {
+        reject(new HttpError(400, `request body exceeds the maximum allowed size of ${MAX_BODY_BYTES} bytes`));
+        return;
+      }
+      resolve(Buffer.concat(chunks).toString('utf8'));
     });
     req.on('error', (error: Error) => {
-      if (!settled) reject(new HttpError(400, `could not read request body: ${error.message}`));
+      if (settled) return;
+      settled = true;
+      reject(new HttpError(400, `could not read request body: ${error.message}`));
     });
   });
 }
