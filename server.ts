@@ -251,11 +251,34 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       || bodyInput.value !== editing.body;
   }
 
-  function startEdit(id) {
-    if (saving) return;
-    if (isDirty() && !window.confirm('当前表单有未保存的修改，打开另一篇草稿将放弃这些输入。确定继续吗？')) {
-      return;
+  function setConflictActionsDisabled(disabled) {
+    // 读取期间禁止重复载入、也禁止点“保留”收起对照面板
+    var btns = conflictBox.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = disabled;
+  }
+
+  // 把单篇接口读到的已保存文章同步进本地列表再载入表单，
+  // 保证列表中这篇草稿的标题、摘要与“编辑中”标识和载入结果一致。
+  function applyLoadedArticle(article, syncList) {
+    if (syncList) {
+      var idx = -1;
+      for (var i = 0; i < articles.length; i++) {
+        if (articles[i] && articles[i].id === article.id) { idx = i; break; }
+      }
+      if (idx >= 0) articles[idx] = article; else articles.push(article);
     }
+    // 正文必须来自单篇接口，绝不使用列表里的摘要充当正文
+    applyEditingState(article);
+  }
+
+  // 通过单篇接口读取一篇草稿当前实际保存的版本并进入编辑态。
+  // 开始时不清空表单，读取期间三个字段仍可输入；保存（及取消）暂时禁用。
+  // 成功返回后按开始读取时的快照判断等待期间是否有新修改：没有（含改回原值）
+  // 直接载入；有则必须由用户明确选择放弃或保留，保留时输入、编辑对象与版本
+  // 基准全部维持原状。失败只提示原因并恢复可操作状态，整个动作只读取内容，
+  // 不保存、不新建、不删除任何记录。
+  function loadArticleIntoEditor(id, options) {
+    if (saving) return;
     // 记录开始读取时的表单快照。读取期间表单仍可继续输入，
     // 成功返回时据此判断是否有等待期间的新修改需要用户明确取舍。
     var snapshot = {
@@ -263,8 +286,9 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       summary: summaryInput.value,
       body: bodyInput.value
     };
-    setSaving(true, '读取中…');
-    setStatus('正在读取草稿内容…', null);
+    setSaving(true, options.loadingLabel);
+    setStatus(options.beginMessage, null);
+    if (options.onBegin) options.onBegin();
     fetch('/api/articles/' + encodeURIComponent(id), { headers: { accept: 'application/json' } })
       .then(function (r) {
         return r.json().catch(function () { return null; }).then(function (data) {
@@ -276,30 +300,66 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       })
       .then(function (article) {
         setSaving(false);
-        // 正文必须来自单篇接口，绝不使用列表里的摘要充当正文
+        if (options.onResolve) options.onResolve();
         if (titleInput.value === snapshot.title
           && summaryInput.value === snapshot.summary
           && bodyInput.value === snapshot.body) {
-          // 等待期间没有新修改（改动后又恢复原值也不算）：照常载入目标草稿
-          applyEditingState(article);
+          // 等待期间没有新修改（改动后又恢复原值也不算）：直接载入
+          applyLoadedArticle(article, options.syncList === true);
           return;
         }
         // 等待期间有了新输入：绝不能直接回填覆盖。在用户明确选择之前，
-        // 三个字段原样保留，表单仍处原先的新建或编辑原草稿状态，
-        // 绝不把当前输入关联到目标文章。
-        if (window.confirm('目标草稿已读取完成，但等待期间你又修改了标题、摘要或正文。'
-          + '打开目标草稿将放弃这些新修改。\n\n'
-          + '点击“确定”放弃新修改并打开目标草稿；点击“取消”保留当前输入，继续原来的操作。')) {
-          applyEditingState(article);
+        // 三个字段、原编辑对象与原版本基准全部保持原状，
+        // 绝不把当前输入关联到其他版本。
+        if (window.confirm(options.changedConfirm)) {
+          applyLoadedArticle(article, options.syncList === true);
         } else {
-          setStatus('已保留当前输入，未打开目标草稿。', null);
+          setStatus(options.keepMessage, null);
         }
       })
       .catch(function (err) {
         setSaving(false);
-        saveBtn.textContent = editing ? '保存修改' : '保存草稿';
-        setStatus('打开草稿失败：' + (err && err.message ? err.message : err) + '，可稍后重试。', 'err');
+        if (options.onReject) options.onReject();
+        setStatus(options.failPrefix + (err && err.message ? err.message : err)
+          + '，当前输入与编辑状态均已保留，可稍后重试。', 'err');
       });
+  }
+
+  function startEdit(id) {
+    if (saving) return;
+    if (isDirty() && !window.confirm('当前表单有未保存的修改，打开另一篇草稿将放弃这些输入。确定继续吗？')) {
+      return;
+    }
+    loadArticleIntoEditor(id, {
+      loadingLabel: '读取中…',
+      beginMessage: '正在读取草稿内容…',
+      changedConfirm: '目标草稿已读取完成，但等待期间你又修改了标题、摘要或正文。'
+        + '打开目标草稿将放弃这些新修改。\\n\\n'
+        + '点击“确定”放弃新修改并打开目标草稿；点击“取消”保留当前输入，继续原来的操作。',
+      keepMessage: '已保留当前输入，未打开目标草稿。',
+      failPrefix: '打开草稿失败：'
+    });
+  }
+
+  // 冲突后“放弃当前输入并载入最新内容”：必须重新读取发生冲突的同一篇草稿
+  // 当前实际保存的版本，绝不能把第一次 409 返回的对照快照当作最新内容——
+  // 对方页面可能在此之后又保存过，那份对照已经过时。
+  function reloadConflictedArticle() {
+    if (!editing || saving) return;
+    var conflictId = editing.id;
+    loadArticleIntoEditor(conflictId, {
+      loadingLabel: '载入中…',
+      beginMessage: '正在重新读取这篇草稿最新的已保存内容…',
+      changedConfirm: '最新内容已读取完成，但等待期间你又修改了标题、摘要或正文。'
+        + '载入最新内容将放弃这些新修改。\\n\\n'
+        + '点击“确定”放弃新修改并载入最新内容；点击“取消”保留当前输入，继续编辑这篇草稿。',
+      keepMessage: '已保留当前输入，编辑对象与版本基准不变；可继续对照后手动调整再保存。',
+      failPrefix: '载入最新内容失败：',
+      syncList: true,
+      onBegin: function () { setConflictActionsDisabled(true); },
+      onResolve: function () { setConflictActionsDisabled(false); },
+      onReject: function () { setConflictActionsDisabled(false); }
+    });
   }
 
   cancelBtn.addEventListener('click', function () {
@@ -378,7 +438,9 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     discard.className = 'danger';
     discard.textContent = '放弃当前输入并载入最新内容';
     discard.addEventListener('click', function () {
-      applyEditingState(saved);
+      // 绝不直接套用本次 409 携带的 saved 快照：它只是第一次冲突时的已保存内容，
+      // 对方页面此后可能又保存过。重新读取同一篇草稿当前实际保存的版本。
+      reloadConflictedArticle();
     });
     var keep = document.createElement('button');
     keep.type = 'button';
