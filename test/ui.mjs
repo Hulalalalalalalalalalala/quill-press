@@ -10,6 +10,23 @@
 const INIT_SOURCE = `(function () {
   if (window.__qtest) return;
   var gate = { enabled: false, hits: 0, pending: [] };
+  // A second, independently controlled gate for single-article reads
+  // (GET /api/articles/:id). It holds "放弃当前输入并载入最新内容" (and 编辑
+  // opens) in flight so tests can type while the read is pending. List reads
+  // and everything else pass through untouched.
+  var readGate = { enabled: false, hits: 0, pending: [] };
+  // The product asks window.confirm before discarding in-flight edits made
+  // while a read was pending. Tests queue the user's answer; calls made with
+  // no queued answer fall through to the native dialog, so an unexpected
+  // guard still surfaces via page.dialogs and fails the scenario.
+  var confirmResponses = [];
+  var confirmLog = [];
+  var origConfirm = window.confirm.bind(window);
+  window.confirm = function (message) {
+    confirmLog.push(String(message));
+    if (confirmResponses.length) return confirmResponses.shift();
+    return origConfirm(message);
+  };
   var origFetch = window.fetch.bind(window);
   function isSaveCall(input, init) {
     var url = typeof input === 'string' ? input : ((input && input.url) || '');
@@ -18,11 +35,23 @@ const INIT_SOURCE = `(function () {
     if (method !== 'POST' && method !== 'PUT') return false;
     return path === '/api/articles' || /^\\/api\\/articles\\//.test(path);
   }
+  function isArticleRead(input, init) {
+    var url = typeof input === 'string' ? input : ((input && input.url) || '');
+    var path = url.split('?')[0];
+    var method = ((init && init.method) || 'GET').toUpperCase();
+    return method === 'GET' && /^\\/api\\/articles\\/[^/]+$/.test(path);
+  }
   window.fetch = function (input, init) {
     if (gate.enabled && isSaveCall(input, init)) {
       gate.hits++;
       return new Promise(function (resolve) {
         gate.pending.push(function () { resolve(origFetch(input, init)); });
+      });
+    }
+    if (readGate.enabled && isArticleRead(input, init)) {
+      readGate.hits++;
+      return new Promise(function (resolve) {
+        readGate.pending.push(function () { resolve(origFetch(input, init)); });
       });
     }
     return origFetch(input, init);
@@ -61,6 +90,25 @@ const INIT_SOURCE = `(function () {
     },
     gateState: function () {
       return { enabled: gate.enabled, hits: gate.hits, pending: gate.pending.length };
+    },
+    readGateOn: function () { readGate.enabled = true; readGate.hits = 0; },
+    readGateOff: function () { readGate.enabled = false; },
+    releaseReads: function () {
+      var pending = readGate.pending;
+      readGate.pending = [];
+      pending.forEach(function (run) { run(); });
+      return pending.length;
+    },
+    readGateState: function () {
+      return { enabled: readGate.enabled, hits: readGate.hits, pending: readGate.pending.length };
+    },
+    confirmNext: function (response) { confirmResponses.push(!!response); },
+    confirmCalls: function () { return confirmLog.slice(); },
+    clickConflictDiscard: function () {
+      var btn = document.querySelector('#conflict-box .actions button.danger');
+      if (!btn) return false;
+      btn.click();
+      return true;
     }
   };
   window.__snap = function () {
@@ -144,6 +192,33 @@ export async function gateOn(page) { await page.eval(`__qtest.gateOn()`); }
 export async function gateOff(page) { await page.eval(`__qtest.gateOff()`); }
 export async function releaseSaves(page) { return page.eval(`__qtest.release()`); }
 
+// The single-article read gate parks "载入最新内容" (and 编辑 opens) inside
+// the browser so scenarios can keep typing while the read is in flight.
+export async function readGateOn(page) { await page.eval(`__qtest.readGateOn()`); }
+export async function readGateOff(page) { await page.eval(`__qtest.readGateOff()`); }
+export async function releaseReads(page) { return page.eval(`__qtest.releaseReads()`); }
+export function readGateState(page) { return page.eval(`__qtest.readGateState()`); }
+
+// Queue the user's answer to the next confirm the product opens (true =
+// 放弃并载入, false = 保留当前输入), and inspect what was asked.
+export async function confirmNext(page, response) {
+  await page.eval(`__qtest.confirmNext(${response ? 'true' : 'false'})`);
+}
+export function confirmCalls(page) { return page.eval(`__qtest.confirmCalls()`); }
+
+export async function clickConflictDiscard(page) {
+  const clicked = await page.eval(`__qtest.clickConflictDiscard()`);
+  if (!clicked) throw new Error('no conflict discard button to click');
+}
+
+// The single-article read is parked in the browser and the UI shows its
+// in-flight state (保存/取消 and the conflict actions temporarily disabled).
+export async function waitReadPending(page, count = 1) {
+  await page.waitFor(
+    `function(){var g=__qtest.readGateState();return g.pending===${count} && __snap().saveDisabled && __snap().saveBtnText==='读取中…';}`,
+    { timeout: 5000, label: `article read #${count} parked while button shows 读取中…` });
+}
+
 // The save request is parked in the browser and the UI shows its in-flight state.
 export async function waitSavingPending(page, count = 1) {
   await page.waitFor(
@@ -183,10 +258,16 @@ export async function getConflict(page) {
         body: val(dds[2])
       };
     }
+    function btnInfo(selector) {
+      var btn = box.querySelector(selector);
+      return btn ? { text: btn.textContent, disabled: btn.disabled } : null;
+    }
     return {
       hidden: box.hidden,
       mine: column('.ver.mine'),
-      saved: column('.ver.saved')
+      saved: column('.ver.saved'),
+      discard: btnInfo('.actions button.danger'),
+      keep: btnInfo('.actions button.secondary')
     };
   })()`);
 }
