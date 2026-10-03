@@ -206,6 +206,20 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     render();
   }
 
+  function renderEditBanner(article) {
+    editBanner.textContent = '';
+    var line1 = document.createElement('div');
+    line1.textContent = '正在编辑草稿：';
+    var code = document.createElement('code');
+    code.textContent = String(article.title);
+    line1.appendChild(code);
+    var line2 = document.createElement('div');
+    line2.className = 'meta';
+    line2.textContent = '创建时间：' + formatTime(article.createdAt) + ' · 标识：' + String(article.id);
+    editBanner.appendChild(line1);
+    editBanner.appendChild(line2);
+  }
+
   function applyEditingState(article) {
     editing = {
       id: article.id,
@@ -218,17 +232,7 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     summaryInput.value = article.summary == null ? '' : String(article.summary);
     bodyInput.value = article.body == null ? '' : String(article.body);
     form.classList.add('editing');
-    editBanner.innerHTML = '';
-    var line1 = document.createElement('div');
-    line1.textContent = '正在编辑草稿：';
-    var code = document.createElement('code');
-    code.textContent = String(article.title);
-    line1.appendChild(code);
-    var line2 = document.createElement('div');
-    line2.className = 'meta';
-    line2.textContent = '创建时间：' + formatTime(article.createdAt) + ' · 标识：' + String(article.id);
-    editBanner.appendChild(line1);
-    editBanner.appendChild(line2);
+    renderEditBanner(article);
     editBanner.hidden = false;
     cancelBtn.hidden = false;
     saveBtn.textContent = '保存修改';
@@ -441,10 +445,16 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           // 成功只确认本次提交的内容；等待响应期间补写的字段原样保留，不被覆盖。
           mergeSavedEditingState(article, submitted);
         } else {
+          // 新建成功：列表只显示本次实际保存的内容。若等待响应期间表单又被改过
+          // 且未恢复为保存值，绝不能清空这些输入——把表单关联到刚创建的同一篇
+          // 草稿进入编辑态，后续“保存修改”按本次响应的版本更新它，不再新建。
           articles.push(article);
-          render();
           setSaving(false);
-          enterCreateMode('草稿已保存。可以继续新建草稿。', 'ok');
+          if (hasUnsavedAfterSave(article, submitted)) {
+            mergeSavedEditingState(article, submitted, true);
+          } else {
+            enterCreateMode('草稿已保存。可以继续新建草稿。', 'ok');
+          }
         }
       })
       .catch(function (err) {
@@ -455,16 +465,29 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       });
   });
 
-  // 保存成功后留在编辑态。成功响应只能确认本次提交的内容：
-  // 服务端返回的已保存内容成为新的本地基准（version 一并推进，再次保存不会误报冲突），
-  // 但等待响应期间用户继续输入过的字段必须完整保留当前值（含换行、空行与清空操作），
-  // 绝不能用刚保存的旧值回填或替换。
-  function mergeSavedEditingState(article, submitted) {
-    var savedFields = [
+  function savedFieldList(article) {
+    return [
       { key: 'title', label: '标题', el: titleInput, value: article.title == null ? '' : String(article.title) },
       { key: 'summary', label: '摘要', el: summaryInput, value: article.summary == null ? '' : String(article.summary) },
       { key: 'body', label: '正文', el: bodyInput, value: article.body == null ? '' : String(article.body) }
     ];
+  }
+
+  // 是否仍有未保存内容，以当前表单与本次成功保存的内容是否相同为准：
+  // 字段仍等于提交快照，或被改过又恢复为服务端保存值（如去首尾空白后的标题），
+  // 都视为没有未保存修改。
+  function hasUnsavedAfterSave(article, submitted) {
+    return savedFieldList(article).some(function (f) {
+      return f.el.value !== submitted[f.key] && f.el.value !== f.value;
+    });
+  }
+
+  // 保存成功后留在编辑态。成功响应只能确认本次提交的内容：
+  // 服务端返回的已保存内容成为新的本地基准（version 一并推进，再次保存不会误报冲突），
+  // 但等待响应期间用户继续输入过的字段必须保留当前值（含换行、空行与清空操作），
+  // 绝不能用刚保存的旧值回填或替换。isCreate 表示这是新建草稿后的首次关联。
+  function mergeSavedEditingState(article, submitted, isCreate) {
+    var savedFields = savedFieldList(article);
     var editedWhileSaving = [];
     savedFields.forEach(function (f) {
       if (f.el.value === submitted[f.key]) {
@@ -484,15 +507,20 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       version: article.version
     };
     form.classList.add('editing');
-    var code = editBanner.querySelector('code');
-    if (code) code.textContent = savedFields[0].value;
+    renderEditBanner(article);
     editBanner.hidden = false;
     cancelBtn.hidden = false;
     saveBtn.textContent = '保存修改';
     hideConflict();
     render();
     if (editedWhileSaving.length === 0) {
-      setStatus('修改已保存。文章标识、创建时间与草稿状态均未改变。', 'ok');
+      setStatus(isCreate
+        ? '草稿已保存。可以继续修改，也可以取消编辑后新建下一篇。'
+        : '修改已保存。文章标识、创建时间与草稿状态均未改变。', 'ok');
+    } else if (isCreate) {
+      setStatus('本次提交的草稿已保存，列表显示的是实际保存的内容。但'
+        + editedWhileSaving.join('、')
+        + '在保存期间又被修改，这些新输入尚未保存；表单已关联到刚创建的这篇草稿，再次点击“保存修改”将更新同一篇。', 'warn');
     } else {
       setStatus('本次提交的内容已保存（文章标识、创建时间与草稿状态不变）。但'
         + editedWhileSaving.join('、')
