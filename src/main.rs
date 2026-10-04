@@ -321,45 +321,53 @@ mod x509 {
             return Err("empty OID".to_string());
         }
         let mut arcs = Vec::new();
-        let first = content[0];
+        // The first subidentifier encodes the first two arcs as
+        // 40*first + second and is itself a base-128 quantity, so it can
+        // span multiple content bytes (e.g. 2.999 encodes as 0x88 0x37).
+        let mut i = 0;
+        let first = read_oid_arc(content, &mut i)?;
         match first {
             0..=39 => {
                 arcs.push(0);
-                arcs.push(first as u64);
+                arcs.push(first);
             }
             40..=79 => {
                 arcs.push(1);
-                arcs.push(first as u64 - 40);
+                arcs.push(first - 40);
             }
             _ => {
                 arcs.push(2);
-                arcs.push(first as u64 - 80);
+                arcs.push(first - 80);
             }
         }
-        let mut i = 1;
         while i < content.len() {
-            let mut value = 0u64;
-            let start = i;
-            loop {
-                let b = content[i];
-                value = value
-                    .checked_mul(128)
-                    .and_then(|v| v.checked_add((b & 0x7F) as u64))
-                    .ok_or_else(|| "OID arc overflow".to_string())?;
-                i += 1;
-                if b & 0x80 == 0 {
-                    break;
-                }
-                if i >= content.len() {
-                    return Err("truncated OID arc".to_string());
-                }
-            }
-            if i - start > 1 && content[start] == 0x80 {
-                return Err("non-minimal OID arc encoding".to_string());
-            }
-            arcs.push(value);
+            arcs.push(read_oid_arc(content, &mut i)?);
         }
         Ok(arcs)
+    }
+
+    /// Read one base-128 subidentifier starting at `*i`. Rejects trailing
+    /// continuation bytes and non-minimal encodings.
+    fn read_oid_arc(content: &[u8], i: &mut usize) -> Result<u64, String> {
+        let start = *i;
+        let mut value = 0u64;
+        loop {
+            let b = *content
+                .get(*i)
+                .ok_or_else(|| "truncated OID arc".to_string())?;
+            value = value
+                .checked_mul(128)
+                .and_then(|v| v.checked_add((b & 0x7F) as u64))
+                .ok_or_else(|| "OID arc overflow".to_string())?;
+            *i += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        if *i - start > 1 && content[start] == 0x80 {
+            return Err("non-minimal OID arc encoding".to_string());
+        }
+        Ok(value)
     }
 
     fn arcs_to_string(arcs: &[u64]) -> String {
