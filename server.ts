@@ -608,7 +608,15 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           // 新建成功：列表只显示本次实际保存的内容。若等待响应期间表单又被改过
           // 且未恢复为保存值，绝不能清空这些输入——把表单关联到刚创建的同一篇
           // 草稿进入编辑态，后续“保存修改”按本次响应的版本更新它，不再新建。
-          articles.push(article);
+          // 列表一律按文章标识区分记录：首次列表结果可能已先到达且包含这篇
+          // 草稿（创建在服务端先完成），此时绝不能再次 push——同一标识只保留
+          // 一条，用本次响应的已保存内容更新既有卡片；标题相同但标识不同的
+          // 其他草稿不受影响，仍是各自一条。
+          var createIdx = -1;
+          for (var j = 0; j < articles.length; j++) {
+            if (articles[j] && articles[j].id === article.id) { createIdx = j; break; }
+          }
+          if (createIdx >= 0) articles[createIdx] = article; else articles.push(article);
           setSaving(false);
           if (hasUnsavedAfterSave(article, submitted)) {
             mergeSavedEditingState(article, submitted, true);

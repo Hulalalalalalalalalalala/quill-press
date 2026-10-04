@@ -23,7 +23,7 @@
 const INIT_SOURCE = `(function () {
   if (window.__qtest) return;
   var origFetch = window.fetch.bind(window);
-  var saveGate = { enabled: false, hits: 0, pending: [] };
+  var saveGate = { enabled: false, hits: 0, pending: [], capture: false };
   var readGate = { enabled: false, hits: 0, pending: [] };
   // null = off; 404/500 = respond with that status once; 'network' = reject once.
   var failNextRead = null;
@@ -147,7 +147,18 @@ const INIT_SOURCE = `(function () {
       }
       return runItemRead(input, init);
     }
-    if (saveGate.enabled && isSaveCall(path, method)) return hold(saveGate, input, init);
+    if (saveGate.enabled && isSaveCall(path, method)) {
+      if (saveGate.capture) {
+        // capture 模式：请求立即真实发往服务端（保存会落库），只把响应扣在
+        // 页面里，用于复现“服务端已保存、列表结果先于创建响应到达页面”。
+        saveGate.hits++;
+        var capturedSave = origFetch(input, init);
+        return new Promise(function (resolve, reject) {
+          saveGate.pending.push(function () { capturedSave.then(resolve, reject); });
+        });
+      }
+      return hold(saveGate, input, init);
+    }
     return origFetch(input, init);
   };
 
@@ -205,7 +216,8 @@ const INIT_SOURCE = `(function () {
       return false;
     },
     gateOn: function () { saveGate.enabled = true; saveGate.hits = 0; },
-    gateOff: function () { saveGate.enabled = false; },
+    gateOff: function () { saveGate.enabled = false; saveGate.capture = false; },
+    gateCaptureOn: function () { saveGate.enabled = true; saveGate.capture = true; saveGate.hits = 0; },
     release: function () { return releaseGate(saveGate); },
     gateState: function () { return gateView(saveGate); },
     readGateOn: function () { readGate.enabled = true; readGate.hits = 0; },
@@ -354,6 +366,9 @@ export async function clickDiscardLoad(page) {
 
 export async function gateOn(page) { await page.eval(`__qtest.gateOn()`); }
 export async function gateOff(page) { await page.eval(`__qtest.gateOff()`); }
+// Capture mode: the save request really reaches the server (the draft is
+// persisted), only its response is parked in the page until releaseSaves.
+export async function gateCaptureOn(page) { await page.eval(`__qtest.gateCaptureOn()`); }
 export async function releaseSaves(page) { return page.eval(`__qtest.release()`); }
 export function gateState(page) { return page.eval(`__qtest.gateState()`); }
 

@@ -6,12 +6,26 @@
 //
 // Run: node test/run.mjs   (CHROME_BIN can override the browser executable)
 import assert from 'node:assert/strict';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { Browser } from './cdp.mjs';
 import { TestServer } from './server.mjs';
 import * as ui from './ui.mjs';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
+
+// Poll the server directly until it has persisted at least `count` articles.
+// Used with the save gate's capture mode, where the save request really
+// reaches the server and only its response is parked in the page.
+async function waitForServerArticles(server, count) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const articles = await server.listArticles();
+    if (articles.length >= count) return articles;
+    if (Date.now() > deadline) throw new Error(`server did not persist ${count} articles in time`);
+    await sleep(25);
+  }
+}
 
 async function seed(server, fields) {
   const res = await server.api('/api/articles', {
@@ -1142,6 +1156,145 @@ test('首次列表请求晚于保存发出、结果已含新草稿：只显示�
       assert.deepEqual(s.cards.map((card) => card.title), ['页面新草稿', '已有草稿']);
       assert.equal(s.cards.filter((card) => card.title === '页面新草稿').length, 1);
       assert.equal(s.cards[0].summary, '页面摘要');
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 15b. First-load race, response-order variant: the create request is saved
+//     on the server, but its success response is still in flight when the
+//     initial list response — already containing the new draft — arrives
+//     first. Processing the late create response must not add a second card
+//     for the same id; same-title drafts with different ids stay separate;
+//     the form is still cleared and create mode kept.
+// ---------------------------------------------------------------------------
+test('首次列表结果（已含新草稿）先于创建响应到达：同一标识只一张卡片、同名不同标识各自保留', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    // 与新草稿同名的已有草稿：标识不同，绝不能被按标题合并。
+    const seededSameTitle = await seed(server, { title: '同名草稿', summary: '服务端同名稿摘要', body: 'b1' });
+    const seededOld = await seed(server, { title: '旧草稿', summary: '旧摘要', body: 'b2' });
+    // deferred：列表请求在放行前没有发出，放行时服务端应答已包含新草稿。
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'deferred' });
+    try {
+      // capture：创建请求真实到达服务端并落库，只有成功响应被扣在页面里。
+      await ui.gateCaptureOn(page);
+      await ui.fill(page, { title: '同名草稿', summary: '页面新摘要', body: '页面新正文' });
+      await ui.clickSave(page);
+      await ui.waitSavingPending(page, 1);
+      // 服务端已保存成功（响应仍扣在页面里，尚未到达）。
+      const persisted = await waitForServerArticles(server, 3);
+      const created = persisted.find((a) => a.summary === '页面新摘要');
+      assert.ok(created, '创建请求应已在服务端落库');
+
+      // 首次列表结果先到达，已包含这篇新草稿。
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+      let s = await ui.state(page);
+      assert.equal(s.listCount, 3);
+      assert.equal(s.cards.filter((card) => card.title === '同名草稿').length, 2);
+      assert.equal(s.cards[0].summary, '页面新摘要', '新草稿最新，排在最前');
+
+      // 创建成功响应随后到达：同一标识不能再出现第二张卡片。
+      await ui.releaseSaves(page);
+      await ui.gateOff(page);
+      await ui.waitForStatus(page, '草稿已保存', 'ok');
+      s = await ui.state(page);
+      assert.equal(s.listCount, 3, '迟到的创建响应不得重复添加同一篇草稿');
+      assert.equal(s.cards.filter((card) => card.title === '同名草稿').length, 2,
+        '标题相同但标识不同的两篇都必须保留');
+      assert.deepEqual(s.cards.map((card) => card.title), ['同名草稿', '旧草稿', '同名草稿']);
+      assert.equal(s.cards[0].summary, '页面新摘要');
+      assert.equal(s.cards[2].summary, '服务端同名稿摘要');
+      // 表单没有未保存内容：成功后照常清空并保留新建入口。
+      assert.deepEqual(s.form, { title: '', summary: '', body: '' });
+      assert.equal(s.formEditing, false);
+      assert.equal(s.saveBtnText, '保存草稿');
+      // 服务端没有因为这次保存多出记录，三篇标识互不相同。
+      const finalArticles = await server.listArticles();
+      assert.equal(finalArticles.length, 3);
+      const ids = finalArticles.map((a) => a.id);
+      assert.equal(new Set(ids).size, 3);
+      assert.ok(ids.includes(seededSameTitle.id) && ids.includes(seededOld.id) && ids.includes(created.id));
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 15c. Same response order as 15b, but the user keeps typing while the create
+//     response is still parked after the list already showed the draft: the
+//     late response must link the form to that same draft (编辑态/保存修改),
+//     keep the unsaved input, show only the saved content on the single card,
+//     and a following save must update that same draft (id/createdAt fixed).
+// ---------------------------------------------------------------------------
+test('列表先显示新草稿、创建响应后到且等待期间有未保存修改：表单关联同一篇、列表只显示已保存内容', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'deferred' });
+    try {
+      await ui.gateCaptureOn(page);
+      await ui.fill(page, { title: '竞态新草稿', summary: '实际保存的摘要', body: '实际保存的正文' });
+      await ui.clickSave(page);
+      await ui.waitSavingPending(page, 1);
+      const persisted = await waitForServerArticles(server, 1);
+      const created = persisted[0];
+
+      // 列表先到：新草稿按已保存内容显示一张卡片。
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+      let s = await ui.state(page);
+      assert.equal(s.listCount, 1);
+      assert.equal(s.cards[0].title, '竞态新草稿');
+
+      // 创建响应仍未到达，用户继续修改摘要和正文（尚未保存）。
+      await ui.fill(page, { summary: '等待期间改写的摘要', body: '等待期间改写的正文' });
+
+      // 创建响应到达：表单关联到刚创建的同一篇草稿，未保存输入保留并被点名。
+      await ui.releaseSaves(page);
+      await ui.gateOff(page);
+      await ui.waitForStatus(page, '尚未保存', 'warn');
+      s = await ui.state(page);
+      assert.match(s.statusText, /摘要、正文|正文、摘要/);
+      assert.equal(s.formEditing, true, '表单应关联到刚创建的草稿进入编辑态');
+      assert.equal(s.bannerId, created.id);
+      assert.equal(s.saveBtnText, '保存修改');
+      assert.deepEqual(s.form, {
+        title: '竞态新草稿',
+        summary: '等待期间改写的摘要',
+        body: '等待期间改写的正文',
+      });
+      // 列表只有一张卡片、只反映实际保存的内容，不能把未提交输入写到卡片上。
+      assert.equal(s.listCount, 1, '同一篇草稿只能有一张卡片');
+      assert.equal(s.cards[0].summary, '实际保存的摘要');
+      assert.equal(s.cards.filter((card) => card.editing).length, 1, '只能有一张“编辑中”卡片');
+
+      // 随后保存修改：更新同一篇草稿，标识与创建时间不变，版本按规则递增。
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '修改已保存', 'ok');
+      const stored = await getArticle(server, created.id);
+      assert.equal(stored.id, created.id);
+      assert.equal(stored.createdAt, created.createdAt);
+      assert.equal(stored.version, created.version + 1);
+      assert.equal(stored.summary, '等待期间改写的摘要');
+      assert.equal(stored.body, '等待期间改写的正文');
+      s = await ui.state(page);
+      assert.equal(s.listCount, 1);
+      assert.equal(s.cards[0].summary, '等待期间改写的摘要');
+      assert.equal((await server.listArticles()).length, 1, '不能另建文章');
     } finally {
       ui.assertNoPageErrors(page);
       await browser.closePage(page);
