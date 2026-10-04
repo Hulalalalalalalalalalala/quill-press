@@ -1307,6 +1307,196 @@ test('列表先显示新草稿、创建响应后到且等待期间有未保存�
 });
 
 // ---------------------------------------------------------------------------
+// 15d. The create response arrives even later than in 15b: while it is parked,
+//     another tab opens the just-created draft and saves it (v2), and the
+//     page's first list result already carries v2. The late v1 create response
+//     must not roll the card back to v1, must not drop other drafts, and —
+//     with no typing during the wait — must still clear the form and keep the
+//     create entry (the save did succeed; the card being newer is not a
+//     failure).
+// ---------------------------------------------------------------------------
+test('首次列表带回更新版本后创建响应才到：卡片不退回旧版本、表单照常清空、其他草稿不丢', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    const seeded = await seed(server, { title: '别人的草稿', summary: '保留摘要', body: '保留正文' });
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'deferred' });
+    try {
+      await ui.gateCaptureOn(page);
+      await ui.fill(page, { title: '竞态草稿', summary: '第一版摘要', body: '第一版正文' });
+      await ui.clickSave(page);
+      await ui.waitSavingPending(page, 1);
+      const persisted = await waitForServerArticles(server, 2);
+      const created = persisted.find((a) => a.title === '竞态草稿');
+      assert.ok(created, '创建请求应已在服务端落库');
+      assert.equal(created.version, 1);
+
+      // 另一页面读取这篇草稿并保存为版本 2（创建响应仍扣在本页面里）。
+      const up = await updateOut(server, created.id, {
+        title: '另一页面改后的标题', summary: '另一页面改后的摘要', body: '另一页面改后的正文',
+      }, 1);
+      assert.equal(up.status, 200, `other-tab update should succeed: ${up.status} ${up.error || ''}`);
+
+      // 首次列表结果先到达，带回的已是版本 2。
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+      let s = await ui.state(page);
+      assert.equal(s.listCount, 2);
+      assert.equal(s.cards[0].title, '另一页面改后的标题');
+      assert.equal(s.cards[0].summary, '另一页面改后的摘要');
+
+      // 版本 1 的创建成功响应随后到达：卡片不能退回第一版。
+      await ui.releaseSaves(page);
+      await ui.gateOff(page);
+      await ui.waitForStatus(page, '草稿已保存', 'ok');
+      s = await ui.state(page);
+      assert.equal(s.listCount, 2, '同一标识只能有一张卡片，其他草稿不能丢');
+      assert.equal(s.cards[0].title, '另一页面改后的标题', '迟到的创建响应不能把卡片退回旧标题');
+      assert.equal(s.cards[0].summary, '另一页面改后的摘要', '迟到的创建响应不能把卡片退回旧摘要');
+      assert.equal(s.cards[1].title, '别人的草稿');
+      assert.equal(s.cards[1].summary, '保留摘要');
+      // 等待期间没有继续修改：创建照常视为成功，表单清空并保留新建入口。
+      assert.deepEqual(s.form, { title: '', summary: '', body: '' });
+      assert.equal(s.formEditing, false);
+      assert.equal(s.saveBtnText, '保存草稿');
+      // 服务端仍是两篇，被另一页面推进的版本不受本页面影响。
+      const finalArticles = await server.listArticles();
+      assert.equal(finalArticles.length, 2);
+      const stored = finalArticles.find((a) => a.id === created.id);
+      assert.equal(stored.version, 2);
+      assert.equal(stored.title, '另一页面改后的标题');
+      assert.ok(finalArticles.some((a) => a.id === seeded.id));
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 15e. Same ordering as 15d, but the user keeps typing while the create
+//     response is parked: the late response links the form to the just-created
+//     draft with the create response's own version as baseline (NOT the newer
+//     v2 the card shows), keeps and names the unsaved fields, and the list
+//     still shows only the saved v2 content. The next save submits that older
+//     baseline, so the existing 409 conflict flow rejects it without
+//     overwriting the other tab's content or creating a second draft; the
+//     explicit "载入最新内容" then loads the current saved article as usual.
+// ---------------------------------------------------------------------------
+test('列表带回更新版本且等待期间有新修改：表单按创建版本关联、再保存走409、载入最新后继续', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'deferred' });
+    try {
+      await ui.gateCaptureOn(page);
+      await ui.fill(page, { title: '竞态草稿', summary: '第一版摘要', body: '第一版正文' });
+      await ui.clickSave(page);
+      await ui.waitSavingPending(page, 1);
+      const persisted = await waitForServerArticles(server, 1);
+      const created = persisted[0];
+
+      // 另一页面把这篇草稿保存为版本 2，首次列表结果带回的即是版本 2。
+      const up = await updateOut(server, created.id, {
+        title: '另一页面改后的标题', summary: '另一页面改后的摘要', body: '另一页面改后的正文',
+      }, 1);
+      assert.equal(up.status, 200, `other-tab update should succeed: ${up.status} ${up.error || ''}`);
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+
+      // 创建响应仍未到达，用户继续修改摘要和正文（尚未保存）。
+      await ui.fill(page, { summary: '等待期间改写的摘要', body: '等待期间改写的正文' });
+
+      // 创建响应到达：表单关联到刚创建的同一篇草稿，未保存输入保留并被点名；
+      // 列表仍只显示另一页面保存的较新内容，不显示未提交输入。
+      await ui.releaseSaves(page);
+      await ui.gateOff(page);
+      await ui.waitForStatus(page, '尚未保存', 'warn');
+      let s = await ui.state(page);
+      assert.match(s.statusText, /摘要、正文|正文、摘要/);
+      assert.equal(s.formEditing, true);
+      assert.equal(s.bannerId, created.id);
+      assert.equal(s.saveBtnText, '保存修改');
+      assert.deepEqual(s.form, {
+        title: '竞态草稿',
+        summary: '等待期间改写的摘要',
+        body: '等待期间改写的正文',
+      });
+      assert.equal(s.listCount, 1, '同一标识只能有一张卡片');
+      assert.equal(s.cards[0].title, '另一页面改后的标题', '卡片不能被迟到的创建响应退回旧版本');
+      assert.equal(s.cards[0].summary, '另一页面改后的摘要');
+      assert.equal(s.cards[0].editing, true);
+
+      // 再次保存：沿用创建结果的版本基准（1），服务端已在版本 2，
+      // 现有冲突处理必须拒绝这次旧版本提交——保留输入、展示较新的已保存内容，
+      // 不覆盖另一页面的修改，也不另建草稿。
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '409', 'err');
+      await ui.waitConflictShown(page);
+      const conflict = await ui.getConflict(page);
+      assert.deepEqual(conflict.mine && { title: conflict.mine.title, summary: conflict.mine.summary, body: conflict.mine.body }, {
+        title: '竞态草稿', summary: '等待期间改写的摘要', body: '等待期间改写的正文',
+      });
+      assert.deepEqual(conflict.saved && { title: conflict.saved.title, summary: conflict.saved.summary, body: conflict.saved.body }, {
+        title: '另一页面改后的标题', summary: '另一页面改后的摘要', body: '另一页面改后的正文',
+      });
+      s = await ui.state(page);
+      assert.deepEqual(s.form, {
+        title: '竞态草稿',
+        summary: '等待期间改写的摘要',
+        body: '等待期间改写的正文',
+      }, '冲突后表单输入必须全部保留');
+      assert.equal(s.listCount, 1);
+      assert.equal(s.cards[0].title, '另一页面改后的标题');
+      let stored = await getArticle(server, created.id);
+      assert.equal(stored.version, 2, '另一页面保存的内容不能被覆盖');
+      assert.equal(stored.title, '另一页面改后的标题');
+      assert.equal((await server.listArticles()).length, 1, '不能另建草稿');
+
+      // 用户明确选择载入最新内容：按已有方式读取当前完整文章后继续编辑。
+      await ui.clickDiscardLoad(page);
+      await ui.waitLoadedDraft(page);
+      s = await ui.state(page);
+      assert.deepEqual(s.form, {
+        title: '另一页面改后的标题',
+        summary: '另一页面改后的摘要',
+        body: '另一页面改后的正文',
+      });
+      assert.equal(s.bannerId, created.id);
+
+      // 基于载入的最新内容继续修改并保存：更新同一篇，不误报冲突。
+      await ui.fill(page, { summary: '载入后改写的摘要' });
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '修改已保存', 'ok');
+      stored = await getArticle(server, created.id);
+      assert.equal(stored.version, 3);
+      assert.equal(stored.summary, '载入后改写的摘要');
+      assert.equal(stored.createdAt, created.createdAt);
+      assert.equal((await server.listArticles()).length, 1, '仍不能另建草稿');
+      s = await ui.state(page);
+      assert.equal(s.listCount, 1);
+      assert.equal(s.cards[0].summary, '载入后改写的摘要');
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+
+//     list response is still in flight. That response carries the older
+//     title/summary/version; merging must not roll the card back, must not
+//     change the editing target or version baseline (a further save updates
+//     the same draft with no false 409), and unsaved typing during the first
+//     save must never be treated as saved.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // 16. The page saves the draft, then edits and saves it again while the stale
 //     list response is still in flight. That response carries the older
 //     title/summary/version; merging must not roll the card back, must not

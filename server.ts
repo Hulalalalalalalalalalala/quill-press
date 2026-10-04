@@ -610,13 +610,23 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           // 草稿进入编辑态，后续“保存修改”按本次响应的版本更新它，不再新建。
           // 列表一律按文章标识区分记录：首次列表结果可能已先到达且包含这篇
           // 草稿（创建在服务端先完成），此时绝不能再次 push——同一标识只保留
-          // 一条，用本次响应的已保存内容更新既有卡片；标题相同但标识不同的
-          // 其他草稿不受影响，仍是各自一条。
+          // 一条；标题相同但标识不同的其他草稿不受影响，仍是各自一条。
+          // 既有卡片可能已经是更新的已保存版本（等待创建结果期间另一页面读取
+          // 这篇草稿并保存过，首次列表结果带回的即是新版本）：迟到的创建结果
+          // 不能把卡片退回更旧的标题、摘要或版本，只有版本不旧于卡片当前版本
+          // 时才用本次响应更新它。表单处理不受影响：本次创建是否成功、表单是否
+          // 清空仍以提交快照与当前输入为准，与卡片上显示的版本无关。
           var createIdx = -1;
           for (var j = 0; j < articles.length; j++) {
             if (articles[j] && articles[j].id === article.id) { createIdx = j; break; }
           }
-          if (createIdx >= 0) articles[createIdx] = article; else articles.push(article);
+          if (createIdx >= 0) {
+            if (versionNumberOf(article) >= versionNumberOf(articles[createIdx])) {
+              articles[createIdx] = article;
+            }
+          } else {
+            articles.push(article);
+          }
           setSaving(false);
           if (hasUnsavedAfterSave(article, submitted)) {
             mergeSavedEditingState(article, submitted, true);
