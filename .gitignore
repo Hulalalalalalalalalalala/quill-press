@@ -1,8 +1,1 @@
-data/
-.cache/
-__pycache__/
-*.py[cod]
-node_modules/
-dist/
-bin/
-.DS_Store
+/target/
