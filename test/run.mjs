@@ -3041,6 +3041,378 @@ test('旧草稿（无version字段）：省略version的更新返回400且不改
   }
 });
 
+// ===========================================================================
+// 取消编辑（cancel-btn）的端到端回归保障。
+// 固定草稿有未保存修改时点击“取消编辑”的取舍，以及退出编辑后仍能正确新建
+// 文章的行为；取消本身只作用于本页状态，绝不保存、删除或新增任何记录。
+// 既有草稿创建、保存修改与版本冲突（409）的公开行为不在这些场景里改变。
+// ===========================================================================
+
+// 已取消编辑、回到新建草稿状态时页面应有的全部表现：表单清空、横幅与
+// “取消编辑”隐藏、提交按钮恢复“保存草稿”、原卡片不再标记“编辑中”，
+// 并明确提示已取消编辑。
+async function assertCreateModeAfterCancel(page, originalTitle) {
+  const s = await ui.state(page);
+  assert.deepEqual(s.form, { title: '', summary: '', body: '' }, '表单必须清空');
+  assert.equal(s.formEditing, false);
+  assert.equal(s.bannerHidden, true, '编辑横幅必须隐藏');
+  assert.equal(s.cancelHidden, true, '“取消编辑”按钮必须隐藏');
+  assert.equal(s.saveBtnText, '保存草稿');
+  assert.equal(s.saveDisabled, false);
+  assert.match(s.statusText, /已取消编辑/);
+  assert.match(s.statusText, /原草稿未改动/);
+  const card = s.cards.find((c) => c.title === originalTitle);
+  assert.ok(card, '原草稿卡片仍在列表中');
+  assert.equal(card.editing, false, '原卡片不能再标记“编辑中”');
+  assert.equal(card.editBtnText, '编辑');
+  assert.equal(card.editBtnDisabled, false);
+}
+
+// ---------------------------------------------------------------------------
+// 29. 有未保存修改时点击“取消编辑”：先说明继续取消会放弃未保存输入、原草稿
+//     不会被删除；在确认里选择取消退出时，三个字段的当前值、正在编辑的文章、
+//     编辑横幅、对应卡片“编辑中”标记和“保存修改”按钮全部保持一致。
+//     清空原本非空的摘要或正文也属于未保存修改，富文本按纯文本保留。
+// ---------------------------------------------------------------------------
+test('取消编辑有未保存修改：确认文案说明放弃输入且不删原稿；取消退出则三字段、编辑对象、横幅、卡片、按钮全部保留', async (browser) => {
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    const a = await seedAndReload(server, page, {
+      title: '取消保留原稿',
+      summary: '原摘要非空',
+      body: '原正文第一段\n\n原正文第二段',
+    });
+    await seed(server, { title: '另一篇不受影响', summary: '其他摘要', body: '其他正文' });
+    await ui.reload(page);
+    await ui.clickEdit(page, '取消保留原稿');
+    await ui.waitLoadedDraft(page);
+
+    // 修改标题、摘要、正文：含多语言、换行、空行与类 HTML 文本。
+    const edited = {
+      title: '  改后的标题  ',
+      summary: '改后的摘要 <script>alert(1)</script>',
+      body: '改后正文第一行\n\n空行\n中文 English café 日本語 العربية\n\n<img src=x><b>不应加粗</b>',
+    };
+    await ui.fill(page, edited);
+
+    // 在确认中选择“取消”：不退出编辑。
+    await ui.setConfirm(page, 'cancel');
+    await ui.resetConfirm(page);
+    await ui.clickCancel(page);
+
+    const confirm = await ui.confirmState(page);
+    assert.equal(confirm.calls.length, 1, '有未保存修改时必须先询问一次');
+    assert.match(confirm.calls[0], /取消将放弃当前未保存的修改/);
+    assert.match(confirm.calls[0], /原草稿不会被删除/);
+    assert.match(confirm.calls[0], /确定取消编辑吗/);
+
+    const s = await ui.state(page);
+    // 三个字段保留点击“取消编辑”前的当前值，一个字符都不动。
+    assert.deepEqual(s.form, edited);
+    // 正在编辑的文章、编辑横幅、卡片标记与提交按钮保持一致。
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerHidden, false);
+    assert.equal(s.bannerId, a.id);
+    assert.equal(s.bannerTitle, '取消保留原稿');
+    assert.equal(s.cancelHidden, false);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.saveDisabled, false);
+    assert.equal(s.cards.find((c) => c.title === '取消保留原稿').editing, true);
+    assert.equal(s.cards.find((c) => c.title === '另一篇不受影响').editing, false);
+    // 取消动作不发任何保存请求：服务端两篇草稿原样不变。
+    const stored = await getArticle(server, a.id);
+    assert.equal(stored.version, 1);
+    assert.equal(stored.title, '取消保留原稿');
+    assert.equal(stored.summary, '原摘要非空');
+    assert.equal(stored.body, '原正文第一段\n\n原正文第二段');
+    assert.equal((await server.listArticles()).length, 2);
+
+    // 之后继续保存，仍更新原来这一篇：保留的输入不会被误当成新文章。
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '修改已保存', 'ok');
+    const after = await ui.state(page);
+    assert.equal(after.bannerId, a.id);
+    assert.equal(after.formEditing, true);
+    const saved = await getArticle(server, a.id);
+    assert.equal(saved.id, a.id);
+    assert.equal(saved.createdAt, a.createdAt);
+    assert.equal(saved.status, 'draft');
+    assert.equal(saved.version, 2);
+    assert.equal(saved.title, '改后的标题'); // 标题按规则去首尾空白
+    assert.equal(saved.summary, edited.summary);
+    assert.equal(saved.body, edited.body);
+    assert.equal((await server.listArticles()).length, 2, '不能新建出第二篇');
+  });
+
+  // 清空原本非空的摘要或正文同样属于未保存修改：不能因为字段变空就直接退出。
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    await seedAndReload(server, page, {
+      title: '清空也算修改', summary: '原本非空摘要', body: '原本非空正文',
+    });
+    await ui.clickEdit(page, '清空也算修改');
+    await ui.waitLoadedDraft(page);
+    await ui.fill(page, { title: '清空也算修改', summary: '', body: '' });
+
+    await ui.setConfirm(page, 'cancel');
+    await ui.resetConfirm(page);
+    await ui.clickCancel(page);
+    assert.equal((await ui.confirmState(page)).calls.length, 1, '清空摘要和正文仍要询问是否放弃');
+    const s = await ui.state(page);
+    // 取消退出：清空被保留，仍在原文章的编辑态。
+    assert.deepEqual(s.form, { title: '清空也算修改', summary: '', body: '' });
+    assert.equal(s.formEditing, true);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.cancelHidden, false);
+    assert.equal(s.cards[0].editing, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 30. 确认放弃未保存修改：表单清空并回到新建草稿状态，编辑横幅与“取消编辑”
+//     隐藏，原卡片不再标记“编辑中”，页面明确提示已取消编辑。取消不保存、
+//     不删除、不增加文章：原草稿已保存的标题、摘要、正文、标识、创建时间、
+//     状态和版本逐项不变，其他草稿也不受影响。
+// ---------------------------------------------------------------------------
+test('取消编辑确认放弃：回到新建态并提示已取消；不保存不删除不新增，原草稿全部字段与版本不变、其他草稿不受影响', async (browser) => {
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    const original = {
+      title: '放弃修改原稿',
+      summary: '已保存摘要 <b>不应加粗</b>',
+      body: '已保存正文第一段\n\n空行\n中文 English café',
+    };
+    const a = await seedAndReload(server, page, original);
+    const other = await seed(server, { title: '旁边的草稿', summary: '旁边摘要', body: '旁边正文' });
+    const otherBefore = await getArticle(server, other.id);
+    await ui.reload(page);
+    await ui.clickEdit(page, original.title);
+    await ui.waitLoadedDraft(page);
+    await ui.fill(page, {
+      title: '准备放弃的标题',
+      summary: '',
+      body: '准备放弃的正文\n\n<html>原样文本</html>',
+    });
+
+    // 挂保存闸门证明“取消”不会发出任何保存请求。
+    await ui.gateOn(page);
+    await ui.setConfirm(page, 'accept');
+    await ui.resetConfirm(page);
+    await ui.clickCancel(page);
+
+    await assertCreateModeAfterCancel(page, original.title);
+    assert.deepEqual(await ui.gateState(page), { enabled: true, hits: 0, pending: 0 },
+      '取消动作不能发出保存请求');
+    await ui.gateOff(page);
+
+    // 原草稿已保存内容逐项不变。
+    const stored = await getArticle(server, a.id);
+    assert.equal(stored.id, a.id);
+    assert.equal(stored.title, original.title);
+    assert.equal(stored.summary, original.summary);
+    assert.equal(stored.body, original.body);
+    assert.equal(stored.createdAt, a.createdAt);
+    assert.equal(stored.status, 'draft');
+    assert.equal(stored.version, 1);
+    // 不删除、不新增：仍是两篇；其他草稿原样。
+    const list = await server.listArticles();
+    assert.equal(list.length, 2);
+    assert.ok(list.some((x) => x.id === a.id), '原草稿仍在');
+    assert.deepEqual(await getArticle(server, other.id), otherBefore, '其他草稿不受影响');
+    // 列表里已保存的类 HTML 摘要按纯文本显示，未执行其中标记。
+    assert.equal(
+      await page.eval(`document.querySelectorAll('#article-list .summary b,#article-list script').length`),
+      0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 31. 放弃修改退出编辑后，再填写内容并保存必须产生一篇拥有独立标识的新草稿：
+//     即使标题与原草稿完全相同，也不能更新原文章；再次打开原草稿，读到的
+//     仍是它此前保存的完整内容。
+// ---------------------------------------------------------------------------
+test('取消编辑退出后保存：产生独立标识的新草稿（同名也不更新原稿）；重开原稿仍读到此前完整内容', async (browser) => {
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    const a = await seedAndReload(server, page, {
+      title: '重名草稿',
+      summary: '原稿摘要',
+      body: '原稿正文\n\n第二段',
+    });
+    await ui.clickEdit(page, '重名草稿');
+    await ui.waitLoadedDraft(page);
+    await ui.fill(page, { title: '不会保存的标题', summary: '不会保存的摘要', body: '不会保存的正文' });
+    await ui.setConfirm(page, 'accept');
+    await ui.clickCancel(page);
+    await assertCreateModeAfterCancel(page, '重名草稿');
+
+    // 退出后填写一篇与原稿标题相同的新草稿并保存。
+    await ui.fill(page, { title: '重名草稿', summary: '新稿摘要', body: '新稿正文\n\n新稿第二段' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '草稿已保存', 'ok');
+
+    const list = await server.listArticles();
+    assert.equal(list.length, 2, '退出后保存必须新增一篇，而不是更新原稿');
+    const original = list.find((x) => x.id === a.id);
+    const fresh = list.find((x) => x.id !== a.id);
+    assert.ok(original && fresh, '原稿与新稿都应存在');
+    assert.notEqual(fresh.id, a.id, '新草稿必须拥有独立标识');
+    assert.equal(fresh.title, '重名草稿');
+    assert.equal(fresh.version, 1);
+    // 原稿没有被这次新建更新：标题、摘要、正文、创建时间、状态、版本都不变。
+    assert.equal(original.title, '重名草稿');
+    assert.equal(original.summary, '原稿摘要');
+    assert.equal(original.body, '原稿正文\n\n第二段');
+    assert.equal(original.createdAt, a.createdAt);
+    assert.equal(original.status, 'draft');
+    assert.equal(original.version, 1);
+
+    // 再次打开原草稿：读到的仍是它此前保存的完整内容，而不是新稿。
+    // 两张卡片标题相同，列表按创建时间倒序：新稿在前、原稿在后。
+    let s = await ui.state(page);
+    assert.equal(s.listCount, 2);
+    assert.equal(s.cards[0].summary, '新稿摘要');
+    assert.equal(s.cards[1].summary, '原稿摘要');
+    await page.eval(
+      `document.querySelectorAll('#article-list article.draft')[1].querySelector('button').click()`);
+    await ui.waitLoadedDraft(page);
+    s = await ui.state(page);
+    assert.equal(s.bannerId, a.id, '同名卡片中打开的必须是原来那一篇');
+    assert.deepEqual(s.form, { title: '重名草稿', summary: '原稿摘要', body: '原稿正文\n\n第二段' });
+    assert.equal(s.formEditing, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 32. 两个不该再询问的条件：打开后没有修改；或修改三个字段后全部恢复到打开
+//     时的值。点击“取消编辑”都应直接返回新建状态，不再弹出是否放弃的确认。
+// ---------------------------------------------------------------------------
+test('取消编辑：打开后无修改，或三字段改后全部恢复原值，都直接回新建态不再询问', async (browser) => {
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    // 条件一：打开后没有任何修改。
+    const a = await seedAndReload(server, page, {
+      title: '无修改取消', summary: '摘要甲', body: '正文甲',
+    });
+    await ui.clickEdit(page, '无修改取消');
+    await ui.waitLoadedDraft(page);
+    await ui.resetConfirm(page);
+    await ui.clickCancel(page);
+    await assertCreateModeAfterCancel(page, '无修改取消');
+    assert.deepEqual((await ui.confirmState(page)).calls, [], '无修改时不应询问是否放弃');
+    assert.equal((await getArticle(server, a.id)).version, 1);
+    assert.equal((await server.listArticles()).length, 1);
+  });
+
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    // 条件二：三个字段都改过，随后逐一恢复为打开时的值（含清空再填回）。
+    const original = { title: '恢复原值取消', summary: '摘要乙', body: '正文乙' };
+    const b = await seedAndReload(server, page, original);
+    await ui.clickEdit(page, original.title);
+    await ui.waitLoadedDraft(page);
+    await ui.fill(page, { title: '临时标题', summary: '', body: '临时正文' });
+    await ui.fill(page, original);
+    await ui.resetConfirm(page);
+    await ui.clickCancel(page);
+    await assertCreateModeAfterCancel(page, original.title);
+    assert.deepEqual((await ui.confirmState(page)).calls, [], '全部恢复原值后不应再询问');
+    const stored = await getArticle(server, b.id);
+    assert.equal(stored.version, 1);
+    assert.deepEqual(
+      { title: stored.title, summary: stored.summary, body: stored.body },
+      { title: original.title, summary: original.summary, body: original.body });
+    assert.equal((await server.listArticles()).length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 33. 页面已因旧版本保存被拒绝（409）而显示双方内容对照时：
+//     - 拒绝取消退出：保留当前输入与对照，仍在原文章编辑态、版本基准不变，
+//       再次保存仍按原来的编辑版本处理，继续返回 409，不能悄悄覆盖对方内容；
+//     - 确认退出：收起冲突对照并回到新建态，服务端最新保存的内容保持不变。
+// ---------------------------------------------------------------------------
+test('取消编辑遇409对照：拒绝取消则保留输入与对照、再保存仍409不覆盖；确认退出则收起对照且服务端内容不变', async (browser) => {
+  const ctx = await freshContext(browser);
+  const { server, page } = ctx;
+  try {
+    const v1 = { title: '冲突取消基准', summary: '基准摘要', body: '基准正文' };
+    const mine = { title: '我未保存的标题', summary: '我未保存的摘要', body: '我未保存的正文' };
+    const v2 = { title: '对方第二版', summary: '对方摘要二', body: '对方正文二' };
+    const { article } = await stageStaleConflict(server, page, v1, mine, v2);
+
+    // 此时表单保留未保存输入、双方对照可见、页面处于原文章编辑态。
+    let s = await ui.state(page);
+    assert.equal(s.conflictHidden, false);
+    assert.deepEqual(s.form, mine);
+    assert.equal(s.bannerId, article.id);
+
+    // 在对照未收起时点“取消编辑”并在确认里选择不退出：输入与对照都保留。
+    await ui.setConfirm(page, 'cancel');
+    await ui.resetConfirm(page);
+    await ui.clickCancel(page);
+    assert.equal((await ui.confirmState(page)).calls.length, 1, '有未保存输入时取消仍需确认');
+    s = await ui.state(page);
+    assert.deepEqual(s.form, mine, '拒绝取消后当前输入必须原样保留');
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerId, article.id);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.cancelHidden, false);
+    assert.equal(s.conflictHidden, false, '冲突对照必须仍然显示');
+    const conflictStill = await ui.getConflict(page);
+    assert.deepEqual(
+      { title: conflictStill.mine.title, summary: conflictStill.mine.summary, body: conflictStill.mine.body },
+      mine);
+    assert.deepEqual(
+      { title: conflictStill.saved.title, summary: conflictStill.saved.summary, body: conflictStill.saved.body },
+      v2);
+
+    // 版本基准没有被推进：再次保存仍按原编辑版本提交，继续收到 409。
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '409', 'err');
+    await ui.waitConflictShown(page);
+    s = await ui.state(page);
+    assert.deepEqual(s.form, mine, '再次 409 不能清空或覆盖当前输入');
+    assert.equal(s.conflictHidden, false);
+    const storedAfterRetry = await getArticle(server, article.id);
+    assert.equal(storedAfterRetry.version, 2, '不能悄悄覆盖对方保存的版本');
+    assert.deepEqual(
+      { title: storedAfterRetry.title, summary: storedAfterRetry.summary, body: storedAfterRetry.body },
+      v2);
+    assert.equal((await server.listArticles()).length, 1);
+
+    // 确认放弃并退出：冲突对照一并收起，回到新建草稿状态。对方的 v2 是页外
+    // 保存、本页列表从未刷新，因此本页卡片标题仍为打开时的 v1 标题（服务端
+    // 实际内容另由下面的单篇读取核对），只需确认它不再标记“编辑中”。
+    await ui.setConfirm(page, 'accept');
+    await ui.resetConfirm(page);
+    await ui.clickCancel(page);
+    await assertCreateModeAfterCancel(page, v1.title);
+    s = await ui.state(page);
+    assert.equal(s.conflictHidden, true, '退出编辑必须同时收起冲突对照');
+    // 退出动作不保存、不覆盖：服务端仍是对方保存的版本 2。
+    const storedAfterCancel = await getArticle(server, article.id);
+    assert.equal(storedAfterCancel.version, 2);
+    assert.equal(storedAfterCancel.id, article.id);
+    assert.equal(storedAfterCancel.createdAt, article.createdAt);
+    assert.equal(storedAfterCancel.status, 'draft');
+    assert.deepEqual(
+      { title: storedAfterCancel.title, summary: storedAfterCancel.summary, body: storedAfterCancel.body },
+      v2);
+    assert.equal((await server.listArticles()).length, 1);
+
+    // 退出后可正常新建一篇草稿，与冲突的那一篇彼此独立。
+    await ui.fill(page, { title: '退出后新建', summary: '新摘要', body: '新正文' });
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '草稿已保存', 'ok');
+    const list = await server.listArticles();
+    assert.equal(list.length, 2);
+    const fresh = list.find((x) => x.id !== article.id);
+    assert.ok(fresh && fresh.id !== article.id);
+    assert.equal(fresh.title, '退出后新建');
+    assert.equal(fresh.version, 1);
+    assert.deepEqual(
+      { title: (await getArticle(server, article.id)).title, version: (await getArticle(server, article.id)).version },
+      { title: v2.title, version: 2 }, '原冲突草稿仍保持对方保存的内容');
+  } finally {
+    await closeContext(ctx, browser);
+  }
+});
+
 // ---------------------------------------------------------------------------
 
 const only = tests.filter((t) => process.env.TEST_FILTER && t.name.includes(process.env.TEST_FILTER));
