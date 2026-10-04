@@ -6,6 +6,8 @@
 //
 // Run: node test/run.mjs   (CHROME_BIN can override the browser executable)
 import assert from 'node:assert/strict';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Browser } from './cdp.mjs';
 import { TestServer } from './server.mjs';
@@ -2427,6 +2429,245 @@ test('打开另一篇草稿：富文本目标载入按纯文本原样；选择�
     const target = (await server.listArticles()).find((a) => a.title === '保真目标');
     assert.equal((await getArticle(server, target.id)).body, '目标正文');
   });
+});
+
+// ===========================================================================
+// 旧版本数据兼容：由旧版本保存、磁盘上没有 version 字段的草稿。
+// 读取时按版本 0 处理，可直接打开编辑，首次保存后变为版本 1；
+// 省略 version 的更新请求仍被拒绝（400），首次保存后再以版本 0 提交则
+// 冲突（409）。旧记录通过直接写入数据目录构造（磁盘上真的没有 version
+// 字段），产品不需要任何迁移功能。每个场景同时核对页面状态与服务端实际
+// 保存结果，现有新建、编辑与冲突处理的公开行为保持不变。
+// ===========================================================================
+
+// 一条与旧版本保存格式完全一致的记录：故意没有 version 字段。
+function legacyDraftRecord(overrides = {}) {
+  return {
+    id: 'legacy-draft-1',
+    title: '旧版草稿标题',
+    summary: '旧版摘要',
+    body: '旧版正文第一段\n\n空行之后\n\n中文 English café 日本語\n\n<legacy>按纯文本显示</legacy>',
+    status: 'draft',
+    createdAt: '2023-04-05T06:07:08.000Z',
+    ...overrides,
+  };
+}
+
+// 把没有 version 字段的旧记录直接写进数据目录（模拟旧版本留下的数据），
+// 服务端按现有兼容规则在读取时把它当作版本 0。
+async function seedLegacy(server, record) {
+  const file = join(server.dataDir, 'articles.json');
+  const records = JSON.parse(await readFile(file, 'utf8'));
+  records.push(record);
+  await writeFile(file, `${JSON.stringify(records, null, 2)}\n`);
+  return record;
+}
+
+// ---------------------------------------------------------------------------
+// 27. 旧草稿的完整使用路径：列表与单篇读取都按版本 0；点击“编辑”载入当前
+//     保存的标题、摘要和完整正文并进入编辑态（仅查看不改变任何已保存内容）；
+//     修改后首次保存更新同一篇，版本恰好 0→1，标识/创建时间/草稿状态不变，
+//     列表同步已保存内容且不多出草稿，其他草稿不受影响。
+// ---------------------------------------------------------------------------
+test('旧草稿（无version字段）：按版本0列出与读取，编辑后首次保存更新同一篇到版本1', async (browser) => {
+  const ctx = await freshContext(browser);
+  const { server, page } = ctx;
+  try {
+    const legacy = await seedLegacy(server, legacyDraftRecord());
+    const other = await seed(server, { title: '正常草稿', summary: '正常摘要', body: '正常正文' });
+    const otherBefore = await getArticle(server, other.id);
+    await ui.reload(page);
+
+    // 首页列表正常显示这篇旧草稿：标题、摘要和创建时间与原记录一致。
+    let s = await ui.state(page);
+    assert.equal(s.listCount, 2);
+    const legacyCard = s.cards.find((c) => c.title === legacy.title);
+    assert.ok(legacyCard, '旧草稿应出现在列表中');
+    assert.equal(legacyCard.summary, legacy.summary);
+    assert.equal(legacyCard.editing, false);
+    const metaOk = await page.eval(`(function () {
+      var cards = document.querySelectorAll('#article-list article.draft');
+      for (var i = 0; i < cards.length; i++) {
+        var h3 = cards[i].querySelector('h3');
+        if (h3 && h3.firstChild && h3.firstChild.nodeValue === ${JSON.stringify(legacy.title)}) {
+          return cards[i].querySelector('.meta').textContent
+            === '创建时间：' + new Date(${JSON.stringify(legacy.createdAt)}).toLocaleString();
+        }
+      }
+      return null;
+    })()`);
+    assert.equal(metaOk, true, '列表中的创建时间应与原记录一致');
+
+    // 文章列表和单篇读取两个入口得到的版本均为 0。
+    const listed = (await server.listArticles()).find((a) => a.id === legacy.id);
+    assert.equal(listed.version, 0, '列表入口应按版本 0 处理');
+    const beforeOpen = await getArticle(server, legacy.id);
+    assert.equal(beforeOpen.version, 0, '单篇读取入口应按版本 0 处理');
+    assert.equal(beforeOpen.body, legacy.body);
+
+    // 点击“编辑”：表单载入当前保存的标题、摘要和完整正文，页面显示文章
+    // 标识与正在编辑状态，提交按钮变为“保存修改”。
+    await ui.clickEdit(page, legacy.title);
+    await ui.waitLoadedDraft(page);
+    s = await ui.state(page);
+    assert.deepEqual(s.form, { title: legacy.title, summary: legacy.summary, body: legacy.body });
+    assert.equal(s.bannerId, legacy.id);
+    assert.equal(s.bannerHidden, false);
+    assert.equal(s.formEditing, true);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.cards.find((c) => c.title === legacy.title).editing, true);
+    // 正文中的中文、多语言、换行、空行与类 HTML 文本按纯文本完整呈现，不执行标记。
+    assert.equal(
+      await page.eval(`document.querySelectorAll('#article-list script,#article-list img,#article-list b,#article-list legacy').length`),
+      0);
+    assert.equal(
+      await page.eval(`document.querySelectorAll('#edit-banner script,#edit-banner img,#edit-banner b').length`),
+      0);
+    assert.equal(page.dialogs.length, 0);
+
+    // 仅查看列表和打开文章不能改变已保存内容，也不能创建替代记录。
+    assert.deepEqual(await getArticle(server, legacy.id), beforeOpen);
+    assert.equal((await server.listArticles()).length, 2);
+
+    // 修改后首次保存：标题按规则去首尾空白，摘要允许清空，正文按提交内容保存。
+    const submitted = {
+      title: '  旧版草稿新标题  ',
+      summary: '',
+      body: '首次保存的正文第一段\n\n空行保留\n\n中文 English café 日本語 العربية\n\n<html>仍按纯文本</html>',
+    };
+    await ui.fill(page, submitted);
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '修改已保存', 'ok');
+    s = await ui.state(page);
+    // 明确显示保存成功，保存后仍处于这篇文章的编辑状态。
+    assert.equal(s.statusKind, 'ok');
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerId, legacy.id);
+    assert.equal(s.bannerTitle, '旧版草稿新标题');
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.saveDisabled, false);
+    // 列表同步显示已保存的标题（已去空白）与清空后的摘要，不能多出一条草稿。
+    assert.equal(s.listCount, 2);
+    const savedCard = s.cards.find((c) => c.title === '旧版草稿新标题');
+    assert.ok(savedCard, '列表应同步显示已保存的新标题');
+    assert.equal(savedCard.summary, null, '摘要已清空，不渲染摘要段');
+    assert.equal(savedCard.editing, true);
+
+    // 服务端实际保存结果与页面一致：同一篇文章，标识、创建时间和草稿状态
+    // 保持不变，版本恰好从 0 变为 1。
+    const saved = await getArticle(server, legacy.id);
+    assert.equal(saved.id, legacy.id);
+    assert.equal(saved.createdAt, legacy.createdAt);
+    assert.equal(saved.status, 'draft');
+    assert.equal(saved.version, 1, '首次更新后版本恰好从 0 变为 1');
+    assert.equal(saved.title, '旧版草稿新标题');
+    assert.equal(saved.summary, '');
+    assert.equal(saved.body, submitted.body);
+    assert.equal((await server.listArticles()).length, 2, '首次保存不能多出一条草稿');
+    // 其他已有草稿不受影响。
+    assert.deepEqual(await getArticle(server, other.id), otherBefore);
+  } finally {
+    await closeContext(ctx, browser);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 28. 旧记录没有版本字段，不等于更新请求可以省略版本：省略 version 的 PUT
+//     仍返回 400 和非空错误说明，旧内容及其读取版本 0 均不改变。
+// ---------------------------------------------------------------------------
+test('旧草稿（无version字段）：省略version的更新请求仍返回400，旧内容与版本0不变', async () => {
+  const server = await TestServer.start();
+  try {
+    const legacy = await seedLegacy(server, legacyDraftRecord());
+    const before = await getArticle(server, legacy.id);
+    assert.equal(before.version, 0);
+
+    const res = await server.api(`/api/articles/${legacy.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ title: '试图更新', summary: '', body: '试图覆盖' }),
+    });
+    assert.equal(res.status, 400, '省略 version 的更新请求必须被拒绝');
+    const data = await res.json();
+    assert.ok(typeof data.error === 'string' && data.error.trim() !== '', '400 必须带非空 error');
+
+    // 旧内容及其读取版本 0 均不改变，也不新增记录。
+    assert.deepEqual(await getArticle(server, legacy.id), before);
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await server.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 29. 旧草稿首次保存成功（版本 1）后，另一个仍以版本 0 提交的更新必须收到
+//     409，响应带回当前已保存的版本 1 及完整内容；首次保存的结果不被覆盖，
+//     也不增加记录。页面路径（编辑基准为版本 0 的页面提交）与接口路径同时
+//     核对。
+// ---------------------------------------------------------------------------
+test('旧草稿首次保存后：仍以版本0提交的更新返回409并带回版本1完整内容，不覆盖不新增', async (browser) => {
+  const ctx = await freshContext(browser);
+  const { server, page } = ctx;
+  try {
+    const legacy = await seedLegacy(server, legacyDraftRecord());
+    await ui.reload(page);
+    // 页面按版本 0 打开旧草稿，版本基准为 0。
+    await ui.clickEdit(page, legacy.title);
+    await ui.waitLoadedDraft(page);
+
+    // 另一页面以版本 0 首次保存成功：同一篇草稿变为版本 1。
+    const firstSave = {
+      title: '首次保存的标题',
+      summary: '首次保存的摘要',
+      body: '首次保存的正文第一段\n\n首次保存的正文第二段',
+    };
+    const up = await updateOut(server, legacy.id, firstSave, 0);
+    assert.equal(up.status, 200, `以版本 0 首次保存应成功：${up.status} ${up.error || ''}`);
+    assert.equal(up.article.version, 1);
+    assert.equal(up.article.id, legacy.id);
+    assert.equal(up.article.createdAt, legacy.createdAt);
+
+    // 本页面仍基于版本 0 提交：必须被 409 拒绝，全部输入保留，
+    // 对照区展示当前已保存的版本 1 完整内容。
+    const mine = { title: '本页标题', summary: '本页摘要', body: '本页正文' };
+    await ui.fill(page, mine);
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '409', 'err');
+    await ui.waitConflictShown(page);
+    const conflict = await ui.getConflict(page);
+    assert.deepEqual(
+      { title: conflict.mine.title, summary: conflict.mine.summary, body: conflict.mine.body }, mine);
+    assert.deepEqual(
+      { title: conflict.saved.title, summary: conflict.saved.summary, body: conflict.saved.body }, firstSave);
+    const s = await ui.state(page);
+    assert.deepEqual(s.form, mine);
+    assert.equal(s.bannerId, legacy.id);
+    assert.equal(s.formEditing, true);
+
+    // 接口层面再核对一次：仍以版本 0 提交的更新返回 409，
+    // 响应带回当前已保存的版本 1 及完整内容。
+    const res = await server.api(`/api/articles/${legacy.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ title: '又一次版本0提交', summary: '', body: 'x', version: 0 }),
+    });
+    assert.equal(res.status, 409);
+    const data = await res.json();
+    assert.ok(typeof data.error === 'string' && data.error.trim() !== '', '409 必须带非空 error');
+    assert.equal(data.article.version, 1, '409 应带回当前已保存的版本 1');
+    assert.deepEqual(
+      { title: data.article.title, summary: data.article.summary, body: data.article.body }, firstSave);
+
+    // 首次保存的结果不被覆盖，也不增加记录。
+    const stored = await getArticle(server, legacy.id);
+    assert.equal(stored.version, 1);
+    assert.deepEqual(
+      { title: stored.title, summary: stored.summary, body: stored.body }, firstSave);
+    assert.equal(stored.id, legacy.id);
+    assert.equal(stored.createdAt, legacy.createdAt);
+    assert.equal(stored.status, 'draft');
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await closeContext(ctx, browser);
+  }
 });
 
 // ===========================================================================
