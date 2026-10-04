@@ -57,6 +57,18 @@ async function closeContext({ server, page }, browser) {
   await server.stop();
 }
 
+// Runs one isolated server/page per starting point (editing a draft vs. a
+// blank create form), so a single scenario can cover both starts without
+// state from one leaking into the other.
+async function withIsolatedContext(browser, fn) {
+  const ctx = await freshContext(browser);
+  try {
+    await fn(ctx);
+  } finally {
+    await closeContext(ctx, browser);
+  }
+}
+
 // Body text exercising plain-text fidelity: Chinese, other scripts, newlines,
 // blank lines and HTML-like markup that must never be parsed or executed.
 const RICH_BODY = '多行正文第一段\n\n中间空行\n\n中文 English café 日本語 العربية 한국어\n\n'
@@ -1705,6 +1717,716 @@ test('首次列表读取失败且本页面无保存：只显示真实失败原�
       throw error;
     }
   }
+});
+
+// ===========================================================================
+// 从草稿列表点击“编辑”打开另一篇草稿（startEdit）的回归保障。
+// 与上面“冲突后载入最新内容”共用 loadFetchedArticle，但起点不同：当前表单
+// 可能正在编辑一篇草稿，也可能仍是新建草稿，且目标由列表卡片上的“编辑”
+// 按钮指定。读取尚未完成时用户可以继续输入，返回内容绝不能直接覆盖这些
+// 输入。每个场景同时核对页面结果（表单、标识、卡片、按钮）与服务端实际
+// 保存的对象，避免“只确认出现过提示、却丢了内容或关联错文章”。
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 19. 当前表单有未保存内容（编辑态与新建态两个起点）时点击目标草稿的
+//     “编辑”：必须先询问是否放弃。取消则不发出读取请求，输入与编辑状态
+//     原样保持；确认（或本来就没有未保存内容）才真正开始读取。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿：有未保存内容先询问；取消不读取且输入/编辑状态不变，确认才开始读取', async (browser) => {
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    // 起点一：正在编辑一篇草稿，且表单有未保存修改。
+    const current = await seed(server, {
+      title: '正在编辑的草稿', summary: '原摘要', body: '原正文',
+    });
+    const targetA = await seed(server, { title: '目标草稿甲', summary: '目标摘要甲', body: '目标正文甲' });
+    await ui.reload(page);
+    await ui.clickEdit(page, '正在编辑的草稿');
+    await ui.waitLoadedDraft(page);
+    const typed = { title: '未保存的新标题', summary: '未保存的新摘要', body: '未保存的新正文' };
+    await ui.fill(page, typed);
+
+    // 取消：不读取目标草稿，表单、编辑对象、版本基准、列表卡片全部不变。
+    await ui.setConfirm(page, 'cancel');
+    await ui.readGateOn(page);
+    await ui.resetConfirm(page);
+    await ui.clickEdit(page, '目标草稿甲');
+    await sleep(50); // 留出时间证明根本没有发出读取请求
+    let confirm = await ui.confirmState(page);
+    assert.equal(confirm.calls.length, 1);
+    assert.match(confirm.calls[0], /当前表单有未保存的修改/);
+    assert.match(confirm.calls[0], /打开另一篇草稿将放弃这些输入/);
+    assert.deepEqual(await ui.readGateState(page), { enabled: true, hits: 0, pending: 0 });
+    let s = await ui.state(page);
+    assert.deepEqual(s.form, typed);
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerId, current.id);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.saveDisabled, false);
+    assert.ok(!s.statusText.includes('正在读取'));
+    // 目标卡片不能被标记为编辑中，原草稿仍是唯一“编辑中”卡片。
+    assert.equal(s.cards.find((c) => c.title === '正在编辑的草稿').editing, true);
+    assert.equal(s.cards.find((c) => c.title === '目标草稿甲').editing, false);
+    // 什么都没保存：两篇草稿的已保存内容与版本都不动。
+    assert.deepEqual(
+      { title: (await getArticle(server, current.id)).title, version: (await getArticle(server, current.id)).version },
+      { title: '正在编辑的草稿', version: 1 });
+
+    // 确认继续：才发出单篇读取并进入读取中状态。
+    await ui.setConfirm(page, 'accept');
+    await ui.resetConfirm(page);
+    await ui.clickEdit(page, '目标草稿甲');
+    await ui.waitReadPending(page, 1);
+    confirm = await ui.confirmState(page);
+    assert.equal(confirm.calls.length, 1, '进入读取只经过一次“是否放弃”确认');
+    s = await ui.state(page);
+    assert.deepEqual(s.fieldsEditable, { title: true, summary: true, body: true });
+    assert.equal(s.saveBtnText, '读取中…');
+    assert.equal(s.saveDisabled, true);
+    assert.match(s.statusText, /正在读取/);
+    // 读取期间不能提前清空表单，也不能提前切换编辑对象/卡片标记。
+    assert.deepEqual(s.form, typed);
+    assert.equal(s.bannerId, current.id);
+    assert.equal(s.cards.find((c) => c.title === '正在编辑的草稿').editing, true);
+    assert.equal(s.cards.find((c) => c.title === '目标草稿甲').editing, false);
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitLoadedDraft(page);
+    s = await ui.state(page);
+    assert.equal(s.bannerId, targetA.id);
+    assert.deepEqual(s.form, { title: '目标草稿甲', summary: '目标摘要甲', body: '目标正文甲' });
+    assert.equal(s.cards.find((c) => c.title === '目标草稿甲').editing, true);
+    // 打开本身不保存：目标仍是版本 1，两篇记录都在。
+    assert.equal((await getArticle(server, targetA.id)).version, 1);
+    assert.equal((await server.listArticles()).length, 2);
+  });
+
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    // 起点二：仍是新建草稿，表单里有未保存内容。
+    await seedAndReload(server, page, { title: '目标草稿乙', summary: '目标摘要乙', body: '目标正文乙' });
+    const draft = { title: '还没保存的标题', summary: '还没保存的摘要', body: '还没保存的正文' };
+    await ui.fill(page, draft);
+
+    // 取消：留在新建态，输入一字不动，不读取、不新增记录。
+    await ui.setConfirm(page, 'cancel');
+    await ui.readGateOn(page);
+    await ui.resetConfirm(page);
+    await ui.clickEdit(page, '目标草稿乙');
+    await sleep(50);
+    assert.equal((await ui.confirmState(page)).calls.length, 1);
+    assert.deepEqual(await ui.readGateState(page), { enabled: true, hits: 0, pending: 0 });
+    let s = await ui.state(page);
+    assert.deepEqual(s.form, draft);
+    assert.equal(s.formEditing, false);
+    assert.equal(s.bannerHidden, true);
+    assert.equal(s.saveBtnText, '保存草稿');
+    const afterCancel = await server.listArticles();
+    assert.equal(afterCancel.length, 1, '取消打开不新建、不保存');
+    assert.equal(afterCancel[0].title, '目标草稿乙');
+    assert.equal(afterCancel[0].version, 1);
+
+    // 确认后开始读取；读取成功且等待期间没有新修改，直接载入目标进入编辑态。
+    await ui.setConfirm(page, 'accept');
+    await ui.resetConfirm(page);
+    await ui.clickEdit(page, '目标草稿乙');
+    await ui.waitReadPending(page, 1);
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitLoadedDraft(page);
+    s = await ui.state(page);
+    assert.equal(s.formEditing, true);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.deepEqual(s.form, { title: '目标草稿乙', summary: '目标摘要乙', body: '目标正文乙' });
+    assert.equal((await server.listArticles()).length, 1, '仅打开、未保存，不新增草稿');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 19b. 表单没有未保存内容时（编辑态且无改动 / 新建态完全空白）点击“编辑”
+//      不弹确认、直接读取并载入；两个起点都覆盖。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿：无未保存内容时不询问直接读取，编辑态与空白新建态都直接载入目标', async (browser) => {
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    // 编辑态打开后未作任何修改，直接切到另一篇：不弹确认。
+    const a = await seedAndReload(server, page, { title: '草稿一', summary: '摘要一', body: '正文一' });
+    const b = await seed(server, { title: '草稿二', summary: '摘要二', body: '正文二' });
+    await ui.reload(page);
+    await ui.clickEdit(page, '草稿一');
+    await ui.waitLoadedDraft(page);
+    await ui.readGateOn(page);
+    await ui.clickEdit(page, '草稿二');
+    await ui.waitReadPending(page, 1);
+    assert.deepEqual((await ui.confirmState(page)).calls, []);
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitLoadedDraft(page);
+    const s = await ui.state(page);
+    assert.equal(s.bannerId, b.id);
+    assert.notEqual(s.bannerId, a.id);
+    assert.deepEqual(s.form, { title: '草稿二', summary: '摘要二', body: '正文二' });
+    assert.equal(s.cards.find((c) => c.title === '草稿二').editing, true);
+    assert.equal(s.cards.find((c) => c.title === '草稿一').editing, false);
+  });
+
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    // 空白新建态：不弹确认，直接读取目标。
+    await seedAndReload(server, page, { title: '空白起点的目标', summary: 's', body: 'b' });
+    await ui.readGateOn(page);
+    await ui.clickEdit(page, '空白起点的目标');
+    await ui.waitReadPending(page, 1);
+    assert.deepEqual((await ui.confirmState(page)).calls, []);
+    const s0 = await ui.state(page);
+    assert.equal(s0.saveBtnText, '读取中…');
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitLoadedDraft(page);
+    const s = await ui.state(page);
+    assert.equal(s.formEditing, true);
+    assert.deepEqual(s.form, { title: '空白起点的目标', summary: 's', body: 'b' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 20. 读取等待期间的界面保障：表单不提前清空、三个字段仍可输入、页面显示
+//     正在读取、保存暂时不可用（不会产生保存请求）、目标卡片不提前标记
+//     “编辑中”。编辑态与新建态两个起点一致。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿读取期间：不提前清空、字段可输入、显示读取中、保存不可用、目标不标记编辑中', async (browser) => {
+  for (const start of ['editing', 'create']) {
+    await withIsolatedContext(browser, async ({ server, page }) => {
+      let originalId = null;
+      let originalForm;
+      if (start === 'editing') {
+        const cur = await seedAndReload(server, page, { title: '当前稿', summary: '当前摘要', body: '当前正文' });
+        await seed(server, { title: '等待目标稿', summary: '目标摘要', body: '目标正文' });
+        await ui.reload(page);
+        await ui.clickEdit(page, '当前稿');
+        await ui.waitLoadedDraft(page);
+        originalId = cur.id;
+        originalForm = { title: '当前稿', summary: '当前摘要', body: '当前正文' };
+      } else {
+        await seedAndReload(server, page, { title: '等待目标稿', summary: '目标摘要', body: '目标正文' });
+        await ui.fill(page, { title: '新建中的标题', summary: '新建中的摘要', body: '新建中的正文' });
+        originalForm = { title: '新建中的标题', summary: '新建中的摘要', body: '新建中的正文' };
+        // 新建态有未保存内容，需要先确认放弃才开始读取。
+        await ui.setConfirm(page, 'accept');
+      }
+      await ui.readGateOn(page);
+      await ui.gateOn(page); // 同时挂保存闸门，验证读取期间点保存不会发请求
+      await ui.resetConfirm(page);
+      await ui.clickEdit(page, '等待目标稿');
+      await ui.waitReadPending(page, 1);
+
+      let s = await ui.state(page);
+      // 开始读取时的输入一个字都不动，编辑对象也不提前切换。
+      assert.deepEqual(s.form, originalForm, `${start}：读取开始时表单不能被清空`);
+      assert.deepEqual(s.fieldsEditable, { title: true, summary: true, body: true });
+      assert.equal(s.saveBtnText, '读取中…');
+      assert.equal(s.saveDisabled, true);
+      assert.match(s.statusText, /正在读取/);
+      if (start === 'editing') assert.equal(s.bannerId, originalId);
+      else assert.equal(s.bannerHidden, true);
+      // 目标卡片尚未标记编辑中（编辑态起点时原稿仍是唯一标记）。
+      assert.equal(s.cards.find((c) => c.title === '等待目标稿').editing, false);
+      if (start === 'editing') assert.equal(s.cards.find((c) => c.title === '当前稿').editing, true);
+
+      // 等待期间三个字段仍可继续输入（这些输入在下一场景再验证取舍）。
+      await ui.fill(page, { title: `${originalForm.title}→等待中`, body: `${originalForm.body}\n等待中补写` });
+      s = await ui.state(page);
+      assert.equal(s.fieldsEditable.title, true);
+      assert.equal(s.form.title, `${originalForm.title}→等待中`);
+      assert.equal(s.saveDisabled, true);
+      // 保存按钮处于读取中禁用态，点击不会产生任何保存请求。
+      await ui.clickSave(page);
+      assert.deepEqual(await ui.gateState(page), { enabled: true, hits: 0, pending: 0 });
+
+      // 返回时等待期间的输入仍在：选择保留（必须在放行前设定，避免竞态）。
+      await ui.setConfirm(page, 'cancel');
+      await ui.releaseReads(page);
+      await ui.readGateOff(page);
+      await ui.waitForStatus(page, '已保留当前输入，未打开目标草稿');
+      await ui.gateOff(page);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 21. 读取成功且三个字段与开始读取时完全相同（含改动后又恢复原值）：直接
+//     载入目标草稿当前已保存的完整内容（正文以单篇接口为准），不再多问
+//     一次。编辑态与新建态两个起点；另验证目标在挂起期间被其他页面更新
+//     时，载入的是本次读取实际返回的新版本。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿返回时无新修改（含改回原值）：直接完整载入目标、不再确认，编辑态与新建态均然', async (browser) => {
+  for (const start of ['editing', 'create']) {
+    await withIsolatedContext(browser, async ({ server, page }) => {
+      const base = { title: '切换基准稿', summary: '基准摘要', body: '基准正文' };
+      let baseId = null;
+      if (start === 'editing') {
+        baseId = (await seed(server, base)).id;
+      }
+      // 目标在挂起期间被其他页面更新为版本 2（含多语言、空行、类 HTML 正文）。
+      const targetV1 = await seed(server, {
+        title: '将被切换的目标', summary: '目标旧摘要', body: '目标旧正文',
+      });
+      await ui.reload(page); // 两个起点都在同一完整列表上开始
+      const targetV2 = {
+        title: '目标当前标题',
+        summary: '目标当前摘要 <b>不应加粗</b>',
+        body: RICH_BODY,
+      };
+      if (start === 'editing') {
+        await ui.clickEdit(page, base.title);
+        await ui.waitLoadedDraft(page);
+      }
+      await ui.readGateOn(page);
+      await ui.clickEdit(page, '将被切换的目标'); // 起点均无未保存内容，无需确认
+      await ui.waitReadPending(page, 1);
+      // 三个字段都改过，随后逐一恢复为开始读取时的值。
+      await ui.fill(page, { title: '临时标题', summary: '临时摘要', body: '临时正文' });
+      await ui.fill(page, start === 'editing'
+        ? { title: base.title, summary: base.summary, body: base.body }
+        : { title: '', summary: '', body: '' });
+      // 挂起期间目标落库为版本 2。
+      const up = await updateOut(server, targetV1.id, targetV2, 1);
+      assert.equal(up.status, 200);
+
+      await ui.releaseReads(page);
+      await ui.readGateOff(page);
+      await ui.waitLoadedDraft(page);
+      // 改动后恢复原值视为未修改：直接载入，不多问一次。
+      assert.deepEqual((await ui.confirmState(page)).calls, []);
+      const s = await ui.state(page);
+      assert.deepEqual(s.form, targetV2);
+      assert.equal(s.bannerId, targetV1.id);
+      if (start === 'editing') assert.notEqual(s.bannerId, baseId);
+      assert.equal(s.formEditing, true);
+      assert.equal(s.saveBtnText, '保存修改');
+      assert.equal(s.cards.find((c) => c.title === targetV2.title).editing, true);
+      // 类 HTML 摘要按纯文本渲染，不产生任何元素。
+      assert.equal(
+        await page.eval(`document.querySelectorAll('#article-list .summary b,#article-list .summary script,#article-list .summary img').length`),
+        0);
+      // 只是读取：目标版本为其他页面保存的 2，本操作不新增、不改版本。
+      const stored = await getArticle(server, targetV1.id);
+      assert.equal(stored.version, 2);
+      assert.equal(stored.body, RICH_BODY);
+      assert.equal((await server.listArticles()).length, start === 'editing' ? 2 : 1);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 22. 读取返回时任一字段仍有新修改：必须先明确提示打开目标将放弃等待期间
+//     的新输入。选择“保留”：返回那一刻的全部输入、原编辑对象与打开时的
+//     版本基准都不变；新建表单也不能悄悄关联到目标草稿；此后保存仍更新
+//     原来的文章（编辑态起点）或仍按新建创建（新建态起点）。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿返回时有新修改：选择保留则全部输入/编辑对象/版本基准不变，保存仍作用于原文章', async (browser) => {
+  // 起点一：正在编辑一篇草稿（版本基准 1）。
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    const cur = await seedAndReload(server, page, { title: '原编辑稿', summary: '原摘要', body: '原正文' });
+    await seed(server, { title: '保留测试目标', summary: '目标摘要', body: '目标正文' });
+    await ui.reload(page);
+    await ui.clickEdit(page, '原编辑稿');
+    await ui.waitLoadedDraft(page);
+    const kept = {
+      title: '等待期间的新标题',
+      summary: '等待期间的新摘要 <script>alert(1)</script>',
+      body: '等待期间的新正文\n\n空行\n中文 English café',
+    };
+    await ui.readGateOn(page);
+    await ui.setConfirm(page, 'cancel'); // 打开前无未保存改动，这里决定的是返回后的取舍
+    await ui.resetConfirm(page);
+    await ui.clickEdit(page, '保留测试目标');
+    await ui.waitReadPending(page, 1);
+    await ui.fill(page, kept);
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitForStatus(page, '已保留当前输入，未打开目标草稿');
+
+    // 返回后只出现“放弃新修改”的取舍确认（打开前表单无改动，没有首次确认）。
+    const confirm = await ui.confirmState(page);
+    assert.equal(confirm.calls.length, 1);
+    assert.match(confirm.calls[0], /打开目标草稿将放弃这些新修改/);
+    let s = await ui.state(page);
+    assert.deepEqual(s.form, kept);
+    assert.equal(s.formEditing, true);
+    assert.equal(s.bannerId, cur.id);
+    assert.equal(s.bannerHidden, false);
+    assert.equal(s.saveBtnText, '保存修改');
+    assert.equal(s.saveDisabled, false);
+    assert.ok(!s.statusText.includes('已载入'));
+    // 目标卡片没有被标记编辑中，原稿才是。
+    assert.equal(s.cards.find((c) => c.title === '原编辑稿').editing, true);
+    assert.equal(s.cards.find((c) => c.title === '保留测试目标').editing, false);
+    // 类 HTML 文本留在纯文本表单里，没有被解析执行。
+    assert.equal(page.dialogs.length, 0);
+    // 读取与保留都不保存：两篇草稿内容/版本不变。
+    assert.equal((await getArticle(server, cur.id)).version, 1);
+    const targetId = (await server.listArticles()).find((a) => a.title === '保留测试目标').id;
+    const targetBefore = await getArticle(server, targetId);
+    assert.equal(targetBefore.version, 1);
+    assert.equal((await server.listArticles()).length, 2);
+
+    // 此后保存仍更新原来的文章：版本基准仍是打开原稿时的 1，一次保存成功到 2。
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '修改已保存', 'ok');
+    const stored = await getArticle(server, cur.id);
+    assert.equal(stored.id, cur.id);
+    assert.equal(stored.version, 2, '不能沿用目标草稿的版本或对象');
+    assert.equal(stored.title, '等待期间的新标题');
+    assert.equal(stored.body, '等待期间的新正文\n\n空行\n中文 English café');
+    s = await ui.state(page);
+    assert.equal(s.bannerId, cur.id);
+    assert.equal((await server.listArticles()).length, 2, '不能把目标草稿另存或误关联');
+    // 目标草稿在这次保存后必须逐字保持原样：保存确实只作用于原文章。
+    assert.deepEqual(await getArticle(server, targetId), targetBefore);
+  });
+
+  // 起点二：仍是新建草稿。保留后表单不能悄悄关联到目标；保存仍是创建。
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    const target = await seedAndReload(server, page, {
+      title: '新建起点的目标', summary: '目标摘要', body: '目标正文',
+    });
+    const draft = { title: '我自己的新稿', summary: '我的摘要', body: '我的正文\n<html>原样</html>' };
+    await ui.fill(page, draft);
+    // 打开前的“是否放弃”选择继续；读取挂起后再切换为保留，供返回后的取舍使用。
+    await ui.setConfirm(page, 'accept');
+    await ui.readGateOn(page);
+    await ui.resetConfirm(page);
+    await ui.clickEdit(page, '新建起点的目标');
+    await ui.waitReadPending(page, 1);
+    await ui.setConfirm(page, 'cancel');
+    // 等待期间继续输入（相对开始读取时的草稿值仍有差异）。
+    await ui.fill(page, { body: `${draft.body}\n等待中再补一段` });
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitForStatus(page, '已保留当前输入，未打开目标草稿');
+
+    const calls = (await ui.confirmState(page)).calls;
+    assert.equal(calls.length, 2, '打开前询问一次、返回后取舍一次');
+    assert.match(calls[0], /当前表单有未保存的修改/);
+    assert.match(calls[1], /打开目标草稿将放弃这些新修改/);
+    const s = await ui.state(page);
+    const expectedForm = { ...draft, body: `${draft.body}\n等待中再补一段` };
+    assert.deepEqual(s.form, expectedForm);
+    assert.equal(s.formEditing, false, '保留后绝不能悄悄关联到目标草稿');
+    assert.equal(s.bannerHidden, true);
+    assert.equal(s.saveBtnText, '保存草稿');
+    assert.equal(s.cards.find((c) => c.title === '新建起点的目标').editing, false);
+    // 读取/保留不保存：仍只有目标一篇，且内容不变。
+    assert.equal((await server.listArticles()).length, 1);
+    assert.equal((await getArticle(server, target.id)).version, 1);
+
+    // 此后保存按新建创建一篇全新草稿，而不是更新目标。
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '草稿已保存', 'ok');
+    const articles = await server.listArticles();
+    assert.equal(articles.length, 2, '保留输入后保存必须是新建，不能更新目标草稿');
+    const mine = articles.find((a) => a.title === '我自己的新稿');
+    assert.ok(mine, '应当新建出属于当前输入的草稿');
+    assert.notEqual(mine.id, target.id);
+    assert.equal(mine.version, 1);
+    assert.equal(mine.body, `${draft.body}\n等待中再补一段`);
+    assert.equal((await getArticle(server, target.id)).version, 1, '目标草稿完全不受影响');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 23. 读取返回时仍有新修改，选择“放弃”：目标草稿三个字段完整填入，编辑
+//     标识与对应卡片同步到目标；继续保存更新目标草稿（版本只加一），不出
+//     现第二条记录，也不沿用原文章版本而产生错误冲突。编辑态与新建态两个
+//     起点；目标正文含中文、多语言、换行、空行与类 HTML，载入按纯文本原样。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿返回时有新修改：选择放弃则完整载入目标并同步标识卡片，再保存更新目标不误报冲突', async (browser) => {
+  for (const start of ['editing', 'create']) {
+    await withIsolatedContext(browser, async ({ server, page }) => {
+      if (start === 'editing') {
+        await seedAndReload(server, page, { title: '将离开的原稿', summary: '原摘要', body: '原正文' });
+      }
+      const target = await seedAndReload(server, page, {
+        title: '放弃后要打开的目标',
+        summary: '目标摘要',
+        body: '目标正文第一版',
+      });
+      if (start === 'editing') {
+        await ui.clickEdit(page, '将离开的原稿');
+        await ui.waitLoadedDraft(page);
+      }
+      // 目标在读取挂起期间被其他页面更新为版本 2（富文本），载入必须取本次读取结果。
+      const targetV2 = {
+        title: '目标当前标题',
+        summary: '目标当前摘要',
+        body: RICH_BODY,
+      };
+      await ui.readGateOn(page);
+      await ui.setConfirm(page, 'accept'); // 返回后选择放弃等待期间输入
+      await ui.resetConfirm(page);
+      await ui.clickEdit(page, '放弃后要打开的目标');
+      await ui.waitReadPending(page, 1);
+      const up = await updateOut(server, target.id, targetV2, 1);
+      assert.equal(up.status, 200);
+      await ui.fill(page, { title: '等待期间乱写的标题', summary: '', body: '等待期间乱写的正文' });
+      await ui.releaseReads(page);
+      await ui.readGateOff(page);
+      await ui.waitLoadedDraft(page);
+
+      const calls = (await ui.confirmState(page)).calls;
+      assert.equal(calls.length, 1);
+      assert.match(calls[0], /放弃新修改并打开目标草稿/);
+      let s = await ui.state(page);
+      // 目标的三个字段完整填入（本次读取到的版本 2），等待期间的清空/乱写全部放弃。
+      assert.deepEqual(s.form, targetV2);
+      assert.equal(s.bannerId, target.id);
+      assert.equal(s.formEditing, true);
+      assert.equal(s.saveBtnText, '保存修改');
+      assert.equal(s.cards.find((c) => c.title === targetV2.title).editing, true);
+      assert.equal(
+        await page.eval(`document.querySelectorAll('#article-list .summary b,#article-list .summary script,#article-list .summary img').length`),
+        0);
+      // 仅完成读取与放弃选择：版本仍是 2，不新增记录。
+      assert.equal((await getArticle(server, target.id)).version, 2);
+
+      // 继续保存：以载入时的版本 2 为基准更新目标到 3，不报 409、不出现第二条。
+      await ui.fill(page, { body: `${RICH_BODY}\n\n切换后补充一段` });
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '修改已保存', 'ok');
+      const stored = await getArticle(server, target.id);
+      assert.equal(stored.id, target.id);
+      assert.equal(stored.createdAt, target.createdAt);
+      assert.equal(stored.status, 'draft');
+      assert.equal(stored.version, 3);
+      assert.equal(stored.body, `${RICH_BODY}\n\n切换后补充一段`);
+      const articles = await server.listArticles();
+      assert.equal(articles.filter((a) => a.id === target.id).length, 1);
+      assert.equal(articles.length, start === 'editing' ? 2 : 1);
+      s = await ui.state(page);
+      assert.equal(s.bannerId, target.id);
+      assert.equal(s.cards.find((c) => c.title === targetV2.title).editing, true);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 24. 等待期间清空摘要或正文同样是受保护的新修改：返回时必须先说明打开
+//     目标会放弃这些输入；选择“保留”时空字段不丢、原状态不变，此后重新
+//     打开目标可正常载入。编辑态与新建态两个起点。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿等待期间清空摘要或正文：清空受保护；保留时空字段不丢，重新打开可载入目标', async (browser) => {
+  for (const start of ['editing', 'create']) {
+    await withIsolatedContext(browser, async ({ server, page }) => {
+      let keptForm;
+      if (start === 'editing') {
+        const cur = await seedAndReload(server, page, {
+          title: '清空保护原稿', summary: '原摘要非空', body: '原正文非空',
+        });
+        await seed(server, { title: '清空保护目标', summary: '目标摘要非空', body: '目标正文非空' });
+        await ui.reload(page);
+        await ui.clickEdit(page, '清空保护原稿');
+        await ui.waitLoadedDraft(page);
+        keptForm = { title: '清空保护原稿', summary: '', body: '' };
+      } else {
+        await seedAndReload(server, page, {
+          title: '清空保护目标', summary: '目标摘要非空', body: '目标正文非空',
+        });
+        await ui.fill(page, { title: '新建标题非空', summary: '新建摘要', body: '新建正文' });
+        keptForm = { title: '新建标题非空', summary: '', body: '' };
+      }
+      await ui.readGateOn(page);
+      if (start === 'create') await ui.setConfirm(page, 'accept'); // 打开前确认继续
+      await ui.resetConfirm(page);
+      await ui.clickEdit(page, '清空保护目标');
+      await ui.waitReadPending(page, 1);
+      await ui.setConfirm(page, 'cancel'); // 返回后选择保留
+      await ui.fill(page, { summary: '', body: '' });
+      await ui.releaseReads(page);
+      await ui.readGateOff(page);
+      await ui.waitForStatus(page, '已保留当前输入，未打开目标草稿');
+
+      const s = await ui.state(page);
+      assert.deepEqual(s.form, keptForm);
+      if (start === 'editing') {
+        assert.equal(s.formEditing, true);
+        assert.match((await ui.confirmState(page)).calls[0], /打开目标草稿将放弃这些新修改/);
+      } else {
+        assert.equal(s.formEditing, false, '新建起点保留后仍不能关联目标');
+        const calls = (await ui.confirmState(page)).calls;
+        assert.match(calls[calls.length - 1], /打开目标草稿将放弃这些新修改/);
+      }
+      // 不清空、不保存：目标摘要正文仍在，版本不变。
+      const target = await getArticle(server,
+        (await server.listArticles()).find((a) => a.title === '清空保护目标').id);
+      assert.notEqual(target.summary, '');
+      assert.notEqual(target.body, '');
+      assert.equal(target.version, 1);
+
+      // 不再改动地重新打开目标：表单相对当前状态仍可能是脏的，确认继续后
+      // 直接完整载入（读取期间无修改，不再出现放弃取舍）。
+      const callsBefore = (await ui.confirmState(page)).calls.length;
+      await ui.setConfirm(page, 'accept');
+      await ui.clickEdit(page, '清空保护目标');
+      await ui.waitLoadedDraft(page);
+      const after = await ui.state(page);
+      assert.deepEqual(after.form, { title: '清空保护目标', summary: '目标摘要非空', body: '目标正文非空' });
+      assert.equal(after.bannerId, target.id);
+      // 至多只有一次“打开前是否放弃”确认，载入本身不再就清空取舍。
+      assert.equal((await ui.confirmState(page)).calls.length, callsBefore + 1);
+      // 载入本身不新增、不改版本。
+      assert.equal((await getArticle(server, target.id)).version, 1);
+      assert.equal((await server.listArticles()).length, start === 'editing' ? 2 : 1);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 25. 读取返回文章不存在（404）、服务端失败（500）或网络失败：显示具体
+//     失败原因，保留等待期间已经输入的内容与原编辑状态（编辑态/新建态），
+//     恢复可操作状态，不显示成功、不切换关联。打开动作本身不保存任何内容；
+//     读取恢复后能正常打开目标。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿读取404/500/网络失败：显示具体原因、保留等待期间输入与原状态、恢复可操作', async (browser) => {
+  for (const start of ['editing', 'create']) {
+    await withIsolatedContext(browser, async ({ server, page }) => {
+      let originalId = null;
+      if (start === 'editing') {
+        const cur = await seed(server, { title: '失败流程原稿', summary: '原摘要', body: '原正文' });
+        originalId = cur.id;
+      }
+      await seed(server, { title: '读取失败目标', summary: '目标摘要', body: '目标正文' });
+      await ui.reload(page);
+      if (start === 'editing') {
+        await ui.clickEdit(page, '失败流程原稿');
+        await ui.waitLoadedDraft(page);
+      }
+
+      const failExpect = [
+        [404, /该草稿已不存在/],
+        [500, /单篇读取暂时不可用/],
+        ['network', /网络连接中断/],
+      ];
+      for (const [mode, reasonRe] of failExpect) {
+        // 每轮开始前的表单状态（首轮是原稿内容或空白；之后沿用上一轮保留下来的输入）。
+        const before = (await ui.state(page)).form;
+        // 让表单相对开始读取时“有等待期间输入”：编辑态追加标记，新建态直接填入。
+        const during = start === 'editing'
+          ? { ...before, title: `${before.title}·等待中${mode}` }
+          : { title: `等待期间的新建标题·${mode}`, summary: '等待期间摘要', body: '等待期间正文' };
+        // 失败路径不会出现返回后取舍；若表单仍有上一轮保留的输入，打开前确认继续。
+        await ui.setConfirm(page, 'accept');
+        await ui.readGateOn(page);
+        await ui.armReadFailure(page, mode);
+        await ui.resetConfirm(page);
+        await ui.clickEdit(page, '读取失败目标');
+        await ui.waitReadPending(page, 1);
+        await ui.fill(page, during);
+        await ui.releaseReads(page);
+        await ui.readGateOff(page);
+        await ui.waitForStatus(page, '打开草稿失败', 'err');
+
+        const s = await ui.state(page);
+        assert.match(s.statusText, /打开草稿失败/);
+        assert.match(s.statusText, reasonRe, `${start}/${String(mode)}：必须显示具体失败原因`);
+        assert.equal(s.statusKind, 'err');
+        assert.ok(!s.statusText.includes('已载入'));
+        assert.equal(s.saveDisabled, false);
+        assert.equal(s.cards.find((c) => c.title === '读取失败目标').editing, false);
+        // 等待期间已经输入的内容原样保留，原编辑状态不变。
+        assert.deepEqual(s.form, during);
+        if (start === 'editing') {
+          assert.equal(s.formEditing, true);
+          assert.equal(s.bannerId, originalId);
+          assert.equal(s.bannerHidden, false);
+          assert.equal(s.saveBtnText, '保存修改');
+          assert.equal(s.cards.find((c) => c.title === '失败流程原稿').editing, true);
+        } else {
+          assert.equal(s.formEditing, false);
+          assert.equal(s.bannerHidden, true);
+          assert.equal(s.saveBtnText, '保存草稿');
+        }
+        assert.equal(await ui.readFailureArmed(page), null);
+        // 失败的打开不保存任何内容、不改版本。
+        const target = (await server.listArticles()).find((a) => a.title === '读取失败目标');
+        assert.equal((await getArticle(server, target.id)).version, 1);
+        if (start === 'editing') assert.equal((await getArticle(server, originalId)).version, 1);
+      }
+
+      // 读取恢复后：确认继续（表单非脏空白），可正常打开目标并进入其编辑态。
+      await ui.setConfirm(page, 'accept');
+      await ui.clickEdit(page, '读取失败目标');
+      await ui.waitLoadedDraft(page);
+      const s = await ui.state(page);
+      const target = (await server.listArticles()).find((a) => a.title === '读取失败目标');
+      assert.equal(s.bannerId, target.id);
+      assert.deepEqual(s.form, { title: '读取失败目标', summary: '目标摘要', body: '目标正文' });
+      assert.equal((await server.listArticles()).length, start === 'editing' ? 2 : 1);
+      // 全程失败尝试没有改动任何已保存内容或版本。
+      assert.equal((await getArticle(server, target.id)).version, 1);
+      if (start === 'editing') assert.equal((await getArticle(server, originalId)).version, 1);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 26. 纯文本保真：目标正文含中文、其他语言、换行、空行与类 HTML 文本时，
+//     “直接载入”与“选择保留”两条路径都必须维持纯文本原样——不执行标记、
+//     不丢换行空行；保留时富文本原样留在表单，随后保存到原文章也原样往返。
+// ---------------------------------------------------------------------------
+test('打开另一篇草稿：富文本目标载入按纯文本原样；选择保留时富文本输入原样保留且保存往返一致', async (browser) => {
+  // 路径一：无等待期间修改，富文本目标被完整载入，表单与卡片均为纯文本。
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    await seedAndReload(server, page, { title: '富文本原稿', summary: 's', body: 'b' });
+    const target = await seed(server, { title: '富文本目标', summary: '摘要\n第二行 <b>x</b>', body: RICH_BODY });
+    await ui.reload(page);
+    await ui.clickEdit(page, '富文本原稿');
+    await ui.waitLoadedDraft(page);
+    await ui.clickEdit(page, '富文本目标');
+    await ui.waitLoadedDraft(page);
+    const s = await ui.state(page);
+    assert.equal(s.form.body, RICH_BODY);
+    assert.equal(s.form.summary, '摘要\n第二行 <b>x</b>');
+    assert.equal(s.bannerId, target.id);
+    // 表单外的列表/横幅中类 HTML 文本不产生元素、不执行脚本。
+    assert.equal(await page.eval(`document.querySelectorAll('#article-list script,#article-list img,#article-list b').length`), 0);
+    assert.equal(await page.eval(`document.querySelectorAll('#edit-banner script,#edit-banner img,#edit-banner b').length`), 0);
+    assert.equal(page.dialogs.length, 0);
+    // 载入不改变服务端内容。
+    assert.equal((await getArticle(server, target.id)).body, RICH_BODY);
+  });
+
+  // 路径二：等待期间把富文本输入到表单，返回后选择保留；内容原样留在表单，
+  // 再保存仍作用于原文章，多语言/换行/空行/类 HTML 经服务端往返完全一致。
+  await withIsolatedContext(browser, async ({ server, page }) => {
+    const cur = await seedAndReload(server, page, { title: '保真原稿', summary: '原摘要', body: '原正文' });
+    await seed(server, { title: '保真目标', summary: '目标摘要', body: '目标正文' });
+    await ui.reload(page);
+    await ui.clickEdit(page, '保真原稿');
+    await ui.waitLoadedDraft(page);
+    await ui.readGateOn(page);
+    await ui.setConfirm(page, 'cancel');
+    await ui.resetConfirm(page);
+    await ui.clickEdit(page, '保真目标');
+    await ui.waitReadPending(page, 1);
+    await ui.fill(page, { title: '保真原稿', summary: '富文本摘要 <img src=x>', body: RICH_BODY });
+    await ui.releaseReads(page);
+    await ui.readGateOff(page);
+    await ui.waitForStatus(page, '已保留当前输入，未打开目标草稿');
+
+    const s = await ui.state(page);
+    assert.equal(s.form.body, RICH_BODY, '保留路径必须原样维持等待期间的富文本输入');
+    assert.equal(s.form.summary, '富文本摘要 <img src=x>');
+    assert.equal(s.bannerId, cur.id);
+    assert.equal(page.dialogs.length, 0);
+    await ui.clickSave(page);
+    await ui.waitForStatus(page, '修改已保存', 'ok');
+    const stored = await getArticle(server, cur.id);
+    assert.equal(stored.id, cur.id);
+    assert.equal(stored.body, RICH_BODY, '富文本经保存与单篇读取往返必须逐字一致');
+    assert.equal(stored.summary, '富文本摘要 <img src=x>');
+    assert.equal(stored.version, 2);
+    // 目标没有被打开也没有被改动。
+    const target = (await server.listArticles()).find((a) => a.title === '保真目标');
+    assert.equal((await getArticle(server, target.id)).body, '目标正文');
+  });
 });
 
 // ===========================================================================
