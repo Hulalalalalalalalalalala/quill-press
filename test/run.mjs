@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Browser } from './cdp.mjs';
 import { TestServer } from './server.mjs';
+import { RawHttp, splitFrames } from './httpraw.mjs';
 import * as ui from './ui.mjs';
 
 const tests = [];
@@ -1703,6 +1704,363 @@ test('首次列表读取失败且本页面无保存：只显示真实失败原�
       await server.stop();
       throw error;
     }
+  }
+});
+
+// ===========================================================================
+// 请求体大小限制的服务端回归保障（上限 5×1024×1024 字节）。
+// 上面的页面测试已覆盖“超长英文正文触发保存失败后保留输入”；这里固定服务端
+// 对“实际发送的整份 JSON 请求体 UTF-8 字节数”的判断本身：
+//   - 标题、摘要、正文、更新时的 version 与 JSON 结构全部计入；
+//   - 合法请求恰好达到上限成功，超出哪怕一个字节也拒绝；
+//   - 中文等多字节文字按字节而非字符计数，换行（JSON 中转义为 \n）同样计入；
+//   - 正文自身未超限、加上其他字段整份请求才超限，也算超限；
+//   - Content-Length 与分块传输遵守同一上限、同一结论；分块时前帧尚在限内、
+//     后帧才让累计字节超限，客户端仍能读到完整、可解析的 400 与非空 error，
+//     而不是连接中断或残缺响应，连接随后还能继续使用；
+//   - 拒绝新建不新增记录；拒绝更新不改动原文章任何字段，其他草稿不受影响；
+//   - 合法新建 201/版本1，合法更新 200/标识与创建时间不变/版本只加一，
+//     多语言与换行内容经现有 GET 读取入口原样取回，标题按规则去首尾空白。
+// 这些场景直接驱动 HTTP（原始 TCP 套接字精确控制线上字节与分块帧），持久化
+// 内容仍只通过现有读取入口核对，不改变首页编辑方式与已公开的保存行为。
+// ===========================================================================
+
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
+
+// 以固定字段顺序构造与页面一致的负载（{title,summary,body}[,version]），
+// 把 padField 用 padUnit 重复填充（剩余字节用 ASCII 'a' 补齐），使整份 JSON
+// 请求体经 UTF-8 编码后恰好为 size 个字节。换行等需 JSON 转义的字符按其
+// 在线上 JSON 文本中的实际字节数计量。
+function buildPaddedObject(version, padField, pad) {
+  const obj = { title: 't', summary: 's', body: 'b' };
+  if (version !== null) obj.version = version; // version 始终位于 body 之后
+  obj[padField] = pad; // 更新已有键，不改变字段顺序
+  return obj;
+}
+
+function sizedObjectBody(size, { version = null, padField = 'body', padUnit = 'x' } = {}) {
+  const overhead = Buffer.byteLength(JSON.stringify(buildPaddedObject(version, padField, '')), 'utf8');
+  const unitWire = Buffer.byteLength(JSON.stringify(buildPaddedObject(version, padField, padUnit)), 'utf8') - overhead;
+  assert.ok(unitWire > 0);
+  const units = Math.floor((size - overhead) / unitWire);
+  let pad = padUnit.repeat(units);
+  let body = Buffer.from(JSON.stringify(buildPaddedObject(version, padField, pad)), 'utf8');
+  if (body.length < size) {
+    pad += 'a'.repeat(size - body.length); // 差额必小于 unitWire，1 字节 ASCII 可精确补齐
+    body = Buffer.from(JSON.stringify(buildPaddedObject(version, padField, pad)), 'utf8');
+  }
+  assert.equal(body.length, size, `无法精确拼出 ${size} 字节的请求体（实际 ${body.length}）`);
+  return body;
+}
+
+// 统一核对超限拒绝：完整可读的 400、非空且明确说明“超过允许大小”的 error。
+function assertTooLargeResponse(res, transport) {
+  assert.equal(res.status, 400, `${transport}：超过上限哪怕一个字节也必须是 400，实际 ${res.status}`);
+  assert.match(res.headers['content-type'] || '', /application\/json/, `${transport}：400 应为 JSON`);
+  const declared = res.headers['content-length'];
+  assert.notEqual(declared, undefined, `${transport}：400 必须带 Content-Length`);
+  assert.equal(res.body.length, Number(declared),
+    `${transport}：必须读到完整 400 响应体（${res.body.length}/${declared}），不能是连接中断或残缺响应`);
+  let data;
+  assert.doesNotThrow(() => { data = JSON.parse(res.body.toString('utf8')); },
+    `${transport}：400 响应体必须是可解析的 JSON`);
+  assert.ok(typeof data.error === 'string' && data.error.trim() !== '',
+    `${transport}：error 必须非空`);
+  assert.match(data.error, /allowed size|too large|exceed/i,
+    `${transport}：error 必须明确说明超过允许大小：${data.error}`);
+  return data.error;
+}
+
+async function startApiOnly() {
+  const server = await TestServer.start();
+  const http = await RawHttp.connect(server.url);
+  return { server, http };
+}
+
+async function stopApiOnly({ server, http }) {
+  await http.close();
+  await server.stop();
+}
+
+async function fetchArticle(server, id) {
+  const res = await server.api(`/api/articles/${id}`);
+  assert.equal(res.status, 200);
+  return (await res.json()).article;
+}
+
+// --- 创建（POST）：恰好到限成功、超一个字节两种传输都拒绝且不新增记录 -------
+test('请求体大小：POST 恰好5MiB成功（201/版本1/内容经GET一致），5MiB+1经Content-Length与分块均完整400且不新增', async () => {
+  const ctx = await startApiOnly();
+  const { server, http } = ctx;
+  try {
+    const exact = sizedObjectBody(MAX_BODY_BYTES); // 全 ASCII，字段字符数=字节数
+    const exactFields = JSON.parse(exact.toString('utf8'));
+
+    // 恰好达到上限：Content-Length 声明，必须成功。
+    let res = await http.send('POST', '/api/articles', exact);
+    assert.equal(res.status, 201, `恰好达到上限应成功，实际 ${res.status}：${res.body.toString().slice(0, 200)}`);
+    const created = JSON.parse(res.body.toString('utf8')).article;
+    assert.equal(typeof created.id, 'string');
+    assert.equal(created.status, 'draft');
+    assert.equal(created.version, 1);
+    assert.ok(!Number.isNaN(Date.parse(created.createdAt)));
+    // 成功保存的内容经现有单篇读取入口取得时与提交一致。
+    const fetched = await fetchArticle(server, created.id);
+    assert.deepEqual(fetched, created);
+    assert.equal(fetched.title, exactFields.title);
+    assert.equal(fetched.summary, exactFields.summary);
+    assert.equal(fetched.body, exactFields.body);
+    assert.equal((await server.listArticles()).length, 1);
+
+    // 超出一个字节：Content-Length 与分块传输必须得到同一个 400。
+    const over = sizedObjectBody(MAX_BODY_BYTES + 1);
+    assert.equal(over.length, exact.length + 1);
+    const errLength = assertTooLargeResponse(
+      await http.send('POST', '/api/articles', over), 'Content-Length');
+    const frames = splitFrames(over, [1024]); // 第一帧 1024 字节（限内），第二帧才越过累计上限
+    const errChunked = assertTooLargeResponse(
+      await http.sendChunked('POST', '/api/articles', frames, { delayMs: 100 }), '分块');
+    assert.equal(errChunked, errLength, '两种传输方式对同一请求体的判断必须一致');
+    assert.deepEqual(await server.listArticles(), [created], '拒绝新建不能多出记录');
+
+    // 分块合法请求（恰好到限）不能因为传输方式被拒绝。
+    const exactChunked = sizedObjectBody(MAX_BODY_BYTES, { padField: 'summary' });
+    res = await http.sendChunked('POST', '/api/articles', splitFrames(exactChunked, [4096, 4096 * 100]));
+    assert.equal(res.status, 201, `分块发送的到限合法请求应成功，实际 ${res.status}`);
+    assert.equal(JSON.parse(res.body.toString('utf8')).article.version, 1);
+    assert.equal((await server.listArticles()).length, 2);
+
+    // 被拒后同一连接仍完整可用：400 不是靠中断连接表达的。
+    const health = await http.get('/health');
+    assert.equal(health.status, 200);
+    assert.match(health.body.toString('utf8'), /"status":"ok"/);
+  } finally {
+    await stopApiOnly(ctx);
+  }
+});
+
+// --- 按 UTF-8 字节而非字符计数：中文（3字节/字）、中文+换行 -----------------
+test('请求体大小：中文等多字节文字与换行按UTF-8字节计数，字符数远低于上限但整份请求超一个字节仍拒绝', async () => {
+  const ctx = await startApiOnly();
+  const { server, http } = ctx;
+  try {
+    // 正文字符数约 174 万、远小于 5,242,880 个“字符”，但整份请求恰好到限：
+    // 必须成功，证明边界按字节、且到限允许。
+    const cnExact = sizedObjectBody(MAX_BODY_BYTES, { padField: 'body', padUnit: '中' });
+    let parsed = JSON.parse(cnExact.toString('utf8'));
+    const exactChars = Array.from(parsed.body).length;
+    assert.ok(exactChars < MAX_BODY_BYTES, '多字节正文字符数本就低于按字符算出的上限');
+    let res = await http.send('POST', '/api/articles', cnExact);
+    assert.equal(res.status, 201, `按字节恰好到限的中文请求应成功，实际 ${res.status}`);
+    const cnArticle = JSON.parse(res.body.toString('utf8')).article;
+    assert.equal((await fetchArticle(server, cnArticle.id)).body, parsed.body);
+
+    // 同样字符计量方式再多一个字节：字符数仍远低于上限，两种传输都必须拒绝。
+    const cnOver = sizedObjectBody(MAX_BODY_BYTES + 1, { padField: 'body', padUnit: '中' });
+    parsed = JSON.parse(cnOver.toString('utf8'));
+    const overChars = Array.from(parsed.body).length;
+    assert.ok(overChars < MAX_BODY_BYTES, '被拒请求的正文字符数仍低于按字符误算的上限');
+    assert.ok(Buffer.byteLength(parsed.body, 'utf8') < cnOver.length, '正文自身未到上限，是整份请求超限');
+    const e1 = assertTooLargeResponse(await http.send('POST', '/api/articles', cnOver), 'Content-Length中文');
+    const e2 = assertTooLargeResponse(
+      await http.sendChunked('POST', '/api/articles', splitFrames(cnOver, [2048]), { delayMs: 50 }),
+      '分块中文');
+    assert.equal(e1, e2);
+
+    // 中文+换行：换行在 JSON 文本中占实际字节（\n 转义），一个都不能漏算。
+    const nlOver = sizedObjectBody(MAX_BODY_BYTES + 1, { padField: 'body', padUnit: '中\n' });
+    parsed = JSON.parse(nlOver.toString('utf8'));
+    assert.ok(Array.from(parsed.body).length < MAX_BODY_BYTES);
+    assert.ok(parsed.body.includes('\n'), '填充确实包含换行');
+    assertTooLargeResponse(await http.send('POST', '/api/articles', nlOver), '中文换行');
+
+    // 对照组：把同一填充缩短到恰好到限，必须成功（不是针对内容类型的拒绝）。
+    const nlExact = sizedObjectBody(MAX_BODY_BYTES, { padField: 'body', padUnit: '中\n' });
+    res = await http.send('POST', '/api/articles', nlExact);
+    assert.equal(res.status, 201, `按字节恰好到限的中文+换行请求应成功，实际 ${res.status}`);
+
+    const list = await server.listArticles();
+    assert.equal(list.length, 2, '只有两次合法新建落库');
+  } finally {
+    await stopApiOnly(ctx);
+  }
+});
+
+// --- 正文自身未超限，靠摘要/JSON 结构把整份请求顶过上限 ----------------------
+test('请求体大小：正文远低于上限但摘要把整份请求顶到5MiB+1同样拒绝；分块跨限响应完整、连接可复用', async () => {
+  const ctx = await startApiOnly();
+  const { server, http } = ctx;
+  try {
+    // 摘要超大、正文仅 1 个字符：超限判断对象是整份请求而非正文字段。
+    const over = sizedObjectBody(MAX_BODY_BYTES + 1, { padField: 'summary', padUnit: '中' });
+    const parsed = JSON.parse(over.toString('utf8'));
+    assert.equal(parsed.body, 'b');
+    assert.ok(Buffer.byteLength(parsed.summary, 'utf8') < over.length);
+    assertTooLargeResponse(await http.send('POST', '/api/articles', over), '摘要超限Content-Length');
+
+    // 分块：先发一小帧（限内），稍候再发把累计字节顶过上限的大帧。
+    assertTooLargeResponse(
+      await http.sendChunked('POST', '/api/articles', splitFrames(over, [512]), { delayMs: 100 }),
+      '摘要超限分块');
+
+    // 同一份填充恰好到限时成功——边界差一个字节结论相反。
+    const exact = sizedObjectBody(MAX_BODY_BYTES, { padField: 'summary', padUnit: '中' });
+    const res = await http.send('POST', '/api/articles', exact);
+    assert.equal(res.status, 201, `摘要填充使整份请求恰好到限应成功，实际 ${res.status}`);
+
+    // 分块的小体积合法多语言请求不能被误拒。
+    const small = Buffer.from(JSON.stringify({
+      title: '分块合法',
+      summary: '摘要含中文',
+      body: '第一行\n\n空行后 café 日本語',
+    }), 'utf8');
+    const smallRes = await http.sendChunked('POST', '/api/articles', splitFrames(small, [16, 40]));
+    assert.equal(smallRes.status, 201);
+    const smallArticle = JSON.parse(smallRes.body.toString('utf8')).article;
+    const fetchedSmall = await fetchArticle(server, smallArticle.id);
+    assert.equal(fetchedSmall.body, '第一行\n\n空行后 café 日本語');
+    assert.equal(fetchedSmall.summary, '摘要含中文');
+
+    // 分块超限被拒后同一连接继续完整可用。
+    const again = await http.get('/api/articles');
+    assert.equal(again.status, 200);
+    const rawIds = JSON.parse(again.body.toString('utf8')).articles.map((x) => x.id).sort();
+    assert.deepEqual(rawIds, (await server.listArticles()).map((x) => x.id).sort());
+    assert.equal(rawIds.length, 2);
+  } finally {
+    await stopApiOnly(ctx);
+  }
+});
+
+// --- 更新（PUT）：到限成功并只加一个版本；超限拒绝则原文章与其他草稿不变 ----
+test('请求体大小：PUT 到限成功（200/标识创建时间状态不变/版本只加一），5MiB+1两种传输完整400且原文章与其他草稿均不变', async () => {
+  const ctx = await startApiOnly();
+  const { server, http } = ctx;
+  try {
+    const seeded = await seed(server, {
+      title: '原标题',
+      summary: '原摘要',
+      body: '原正文第一段\n\n原正文第二段',
+    });
+    const other = await seed(server, { title: '另一篇草稿', summary: '别的摘要', body: '别的正文' });
+    const before = await fetchArticle(server, seeded.id);
+    const otherBefore = await fetchArticle(server, other.id);
+    assert.equal(before.version, 1);
+
+    const assertUntouched = async (label) => {
+      assert.deepEqual(await fetchArticle(server, seeded.id), before,
+        `${label}：原文章的标题、摘要、正文、标识、创建时间、草稿状态与版本必须保持原值`);
+      assert.deepEqual(await fetchArticle(server, other.id), otherBefore,
+        `${label}：其他草稿不能受影响`);
+      assert.equal((await server.listArticles()).length, 2, `${label}：不能新增或减少记录`);
+    };
+
+    // 超过一个字节：Content-Length 与分块（前帧限内、后帧越限）都完整 400。
+    const over = sizedObjectBody(MAX_BODY_BYTES + 1, { version: 1 });
+    assertTooLargeResponse(
+      await http.send('PUT', `/api/articles/${seeded.id}`, over), 'PUT Content-Length');
+    await assertUntouched('PUT超限(Content-Length)');
+    assertTooLargeResponse(
+      await http.sendChunked('PUT', `/api/articles/${seeded.id}`, splitFrames(over, [1024]), { delayMs: 100 }),
+      'PUT 分块');
+    await assertUntouched('PUT超限(分块)');
+
+    // 恰好到限：两种传输都成功；标识/创建时间/草稿状态不变，版本只加一次。
+    const exactV1 = sizedObjectBody(MAX_BODY_BYTES, { version: 1 });
+    const exactFields = JSON.parse(exactV1.toString('utf8'));
+    let res = await http.send('PUT', `/api/articles/${seeded.id}`, exactV1);
+    assert.equal(res.status, 200, `PUT 恰好到限应成功，实际 ${res.status}`);
+    let updated = JSON.parse(res.body.toString('utf8')).article;
+    assert.equal(updated.id, before.id);
+    assert.equal(updated.createdAt, before.createdAt);
+    assert.equal(updated.status, 'draft');
+    assert.equal(updated.version, 2, '版本只能增加一次');
+    assert.deepEqual(
+      { title: updated.title, summary: updated.summary, body: updated.body },
+      { title: exactFields.title, summary: exactFields.summary, body: exactFields.body });
+    let stored = await fetchArticle(server, seeded.id);
+    assert.deepEqual(stored, updated);
+
+    // 分块到限同样成功，版本再只加一次（2→3）。
+    const exactV2 = sizedObjectBody(MAX_BODY_BYTES, { version: 2, padField: 'summary' });
+    const exactV2Fields = JSON.parse(exactV2.toString('utf8'));
+    res = await http.sendChunked('PUT', `/api/articles/${seeded.id}`,
+      splitFrames(exactV2, [8192, 8192 * 200]), { delayMs: 30 });
+    assert.equal(res.status, 200, `分块 PUT 恰好到限应成功，实际 ${res.status}`);
+    updated = JSON.parse(res.body.toString('utf8')).article;
+    assert.equal(updated.id, before.id);
+    assert.equal(updated.createdAt, before.createdAt);
+    assert.equal(updated.status, 'draft');
+    assert.equal(updated.version, 3, '每次合法更新版本只增加一次');
+    assert.equal(updated.body, exactV2Fields.body);
+    stored = await fetchArticle(server, seeded.id);
+    assert.deepEqual(stored, updated);
+
+    // 另一篇草稿自始至终未被改动；被拒/成功都未增减记录。
+    assert.deepEqual(await fetchArticle(server, other.id), otherBefore);
+    assert.equal((await server.listArticles()).length, 2);
+
+    // 分块被拒（针对不存在的文章也是先判大小）后连接仍可完整复用。
+    const overMissing = sizedObjectBody(MAX_BODY_BYTES + 1, { version: 1 });
+    assertTooLargeResponse(
+      await http.sendChunked('PUT', '/api/articles/does-not-exist', splitFrames(overMissing, [1024]), { delayMs: 50 }),
+      'PUT 不存在文章超限');
+    const health = await http.get('/health');
+    assert.equal(health.status, 200);
+    const reread = await http.get(`/api/articles/${seeded.id}`);
+    assert.equal(reread.status, 200);
+    assert.deepEqual(JSON.parse(reread.body.toString('utf8')).article, stored);
+  } finally {
+    await stopApiOnly(ctx);
+  }
+});
+
+// --- 合法保存的多语言/换行/空行内容经现有读取入口原样往返；标题去空白 --------
+test('请求体大小：常规合法保存的中文、其他语言、换行空行经GET原样取回；标题去首尾空白；版本每次只加一', async () => {
+  const ctx = await startApiOnly();
+  const { server } = ctx;
+  try {
+    const rich = {
+      title: '  标题 两侧空白将被去除 \t ',
+      summary: '摘要第一行\n摘要第二行\n',
+      body: '多行正文第一段\n\n空行之后是中文 English café 日本語 العربية 한국어\n\n'
+        + '<script>alert(1)</script>\n<html>按原文保存</html>\n\n末行后保留换行吗？不，结尾无换行',
+    };
+    const createRes = await server.api('/api/articles', { method: 'POST', body: JSON.stringify(rich) });
+    assert.equal(createRes.status, 201);
+    const created = (await createRes.json()).article;
+    assert.equal(created.version, 1);
+    assert.equal(created.status, 'draft');
+    assert.equal(created.title, rich.title.trim(), '标题按现有规则去除首尾空白');
+    let saved = await fetchArticle(server, created.id);
+    assert.equal(saved.title, rich.title.trim());
+    assert.equal(saved.summary, rich.summary, '摘要中的换行必须原样保存');
+    assert.equal(saved.body, rich.body, '正文（多语言、换行、空行、类HTML）必须原样保存');
+
+    // 连续两次更新：标识与创建时间不变，版本每次只加一，内容逐次原样往返。
+    for (let i = 0; i < 2; i++) {
+      const next = {
+        title: `  第${'二三四'[i]}次标题  `,
+        summary: '',
+        body: `${rich.body}\n\n第${i + 2}版新增空行：\n\t制表符与中文保留`,
+        version: i + 1,
+      };
+      const res = await server.api(`/api/articles/${created.id}`, { method: 'PUT', body: JSON.stringify(next) });
+      assert.equal(res.status, 200);
+      const article = (await res.json()).article;
+      assert.equal(article.id, created.id);
+      assert.equal(article.createdAt, created.createdAt);
+      assert.equal(article.status, 'draft');
+      assert.equal(article.version, i + 2);
+      saved = await fetchArticle(server, created.id);
+      assert.equal(saved.title, next.title.trim());
+      assert.equal(saved.summary, '');
+      assert.equal(saved.body, next.body);
+      assert.deepEqual(saved, article);
+    }
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await stopApiOnly(ctx);
   }
 });
 
