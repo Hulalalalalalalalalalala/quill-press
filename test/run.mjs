@@ -6,6 +6,7 @@
 //
 // Run: node test/run.mjs   (CHROME_BIN can override the browser executable)
 import assert from 'node:assert/strict';
+import { request } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Browser } from './cdp.mjs';
 import { TestServer } from './server.mjs';
@@ -1703,6 +1704,278 @@ test('首次列表读取失败且本页面无保存：只显示真实失败原�
       await server.stop();
       throw error;
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 19–22. 请求大小上限回归（服务端层面，直接走 HTTP，不需要浏览器）：
+//        上限 5×1024×1024 字节，按整个 JSON 请求体的 UTF-8 字节数计算
+//        （标题、摘要、正文、更新时的 version 与 JSON 结构都计入），
+//        新建与保存修改接口一致，Content-Length 与分块传输一致。
+// ---------------------------------------------------------------------------
+const MAX_REQUEST_BYTES = 5 * 1024 * 1024;
+
+// 把正文填充到让整个序列化后的 JSON 请求体恰好是 targetBytes 个 UTF-8 字节，
+// 固定“按整份请求计、不只按正文字符数计”的判定对象。
+function jsonPayloadOfSize(targetBytes, { title = '边界标题', summary = '边界摘要', version } = {}) {
+  const base = version === undefined
+    ? { title, summary, body: '' }
+    : { title, summary, body: '', version };
+  const overhead = Buffer.byteLength(JSON.stringify(base), 'utf8');
+  const fill = targetBytes - overhead;
+  assert.ok(fill >= 0, `JSON 结构本身（${overhead} 字节）不应超过目标大小 ${targetBytes}`);
+  const text = JSON.stringify({ ...base, body: 'x'.repeat(fill) });
+  assert.equal(Buffer.byteLength(text, 'utf8'), targetBytes);
+  return text;
+}
+
+// 向真实服务器发一个请求：要么带显式 Content-Length（body），要么不声明
+// 总长度、用分块传输逐块发送（chunks）。两种方式都必须拿到完整可读的响应，
+// 不能是连接中断或残缺内容。
+function sendRaw(server, { method, path, body, chunks }) {
+  assert.ok((body === undefined) !== (chunks === undefined), 'body 与 chunks 二选一');
+  return new Promise((resolve, reject) => {
+    const url = new URL(server.url);
+    const headers = { 'content-type': 'application/json', accept: 'application/json' };
+    if (chunks) headers['transfer-encoding'] = 'chunked';
+    else headers['content-length'] = Buffer.byteLength(body, 'utf8');
+    const req = request({
+      hostname: url.hostname,
+      port: url.port,
+      path,
+      method,
+      headers,
+    }, (res) => {
+      const parts = [];
+      res.on('data', (part) => parts.push(part));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        headers: res.headers,
+        body: Buffer.concat(parts).toString('utf8'),
+      }));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    if (chunks) for (const chunk of chunks) req.write(chunk);
+    else req.write(body);
+    req.end();
+  });
+}
+
+// 超限拒绝必须是完整、可解析的 400：声明长度与实际响应体一致，非空 error
+// 明确说明超过允许大小——不能只是连接中断、残缺响应或无法解析的内容。
+function assertOversizeRejected(res) {
+  assert.equal(res.status, 400, `超限请求应返回 400，实际为 ${res.status}`);
+  const declared = Number(res.headers['content-length']);
+  assert.ok(Number.isFinite(declared) && declared > 0, '400 响应必须声明完整长度');
+  assert.equal(Buffer.byteLength(res.body, 'utf8'), declared, '400 响应体必须完整可读，不能残缺');
+  const data = JSON.parse(res.body); // 响应必须可解析为 JSON
+  assert.ok(typeof data.error === 'string' && data.error.length > 0, '400 必须带非空 error');
+  assert.match(data.error, /exceed|超过/i, 'error 必须明确说明超过允许大小');
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// 19. POST boundary: exactly at the limit succeeds (201, version 1); one byte
+//     over is rejected; a body that is itself under the limit but pushes the
+//     whole request over it (title/summary/JSON structure) is rejected too.
+// ---------------------------------------------------------------------------
+test('新建接口大小上限：恰好上限成功（201/版本1），超一字节或整份请求超限均拒绝且不新增记录', async () => {
+  const server = await TestServer.start();
+  try {
+    // 恰好达到上限（含标题、摘要与 JSON 结构）：成功，返回 201 与版本 1 的草稿。
+    const exact = jsonPayloadOfSize(MAX_REQUEST_BYTES);
+    let res = await sendRaw(server, { method: 'POST', path: '/api/articles', body: exact });
+    assert.equal(res.status, 201);
+    const created = JSON.parse(res.body).article;
+    assert.equal(created.version, 1);
+    assert.equal(created.status, 'draft');
+    assert.ok(typeof created.id === 'string' && created.id.length > 0);
+    assert.ok(typeof created.createdAt === 'string');
+    assert.match(created.createdAt, /(Z|[+-]\d{2}:?\d{2})$/, '创建时间必须是带时区的 ISO 格式');
+    // 上限内的内容完整落库，通过现有读取入口取得时与提交一致。
+    const fetched = await getArticle(server, created.id);
+    assert.equal(fetched.body, created.body);
+    assert.equal(fetched.body.length, JSON.parse(exact).body.length);
+    assert.equal((await server.listArticles()).length, 1);
+
+    // 超过上限哪怕只有一个字节：完整可读的 400，列表不多出记录。
+    const over = jsonPayloadOfSize(MAX_REQUEST_BYTES + 1);
+    res = await sendRaw(server, { method: 'POST', path: '/api/articles', body: over });
+    assertOversizeRejected(res);
+    assert.equal((await server.listArticles()).length, 1);
+
+    // 正文自身未到上限，加上标题、摘要与 JSON 结构后整份请求才超限：同样拒绝。
+    const bodyOnlyBytes = MAX_REQUEST_BYTES - 20;
+    assert.ok(bodyOnlyBytes < MAX_REQUEST_BYTES, '正文自身确实低于上限');
+    const fat = JSON.stringify({ title: 't', summary: 's', body: 'y'.repeat(bodyOnlyBytes) });
+    assert.ok(Buffer.byteLength(fat, 'utf8') > MAX_REQUEST_BYTES, '整份请求确实超过上限');
+    res = await sendRaw(server, { method: 'POST', path: '/api/articles', body: fat });
+    assertOversizeRejected(res);
+    assert.equal((await server.listArticles()).length, 1);
+  } finally {
+    await server.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 20. Byte (not character) accounting: a Chinese payload whose character
+//     count is far below the limit but whose UTF-8 byte size exceeds it must
+//     be rejected. Legal multilingual content with newlines/blank lines is
+//     stored verbatim and the title is trimmed per the existing rule.
+// ---------------------------------------------------------------------------
+test('大小按UTF-8字节而非字符数判定：中文超限必拒；多语言、换行与空行按原文保存、标题去首尾空白', async () => {
+  const server = await TestServer.start();
+  try {
+    // 字符数远低于上限、UTF-8 字节数超过上限的中文请求：必须拒绝。
+    // 若按字符数误判，这个请求会被错误放行。
+    const chineseBody = '中'.repeat(2 * 1024 * 1024); // 约 2M 字符 = 约 6MiB 字节
+    const zhPayload = JSON.stringify({ title: '中文标题', summary: '中文摘要', body: chineseBody });
+    assert.ok(zhPayload.length < MAX_REQUEST_BYTES, '字符数确实低于上限');
+    assert.ok(Buffer.byteLength(zhPayload, 'utf8') > MAX_REQUEST_BYTES, 'UTF-8 字节数确实超过上限');
+    let res = await sendRaw(server, { method: 'POST', path: '/api/articles', body: zhPayload });
+    assertOversizeRejected(res);
+    assert.deepEqual(await server.listArticles(), [], '被拒绝的新建不能留下记录');
+
+    // 合法多语言请求：中文、其他语言文字、换行与空行按原文保存，标题去首尾空白。
+    const body = '第一段 中文\n\n空行之后 English café 日本語 العربية 한국어\n\n末段';
+    res = await sendRaw(server, {
+      method: 'POST',
+      path: '/api/articles',
+      body: JSON.stringify({ title: '  多语言标题  ', summary: '摘要 café 日本語', body }),
+    });
+    assert.equal(res.status, 201);
+    const created = JSON.parse(res.body).article;
+    assert.equal(created.title, '多语言标题');
+    assert.equal(created.summary, '摘要 café 日本語');
+    assert.equal(created.body, body);
+    // 通过现有读取入口取得的内容与提交内容一致。
+    const fetched = await getArticle(server, created.id);
+    assert.equal(fetched.title, '多语言标题');
+    assert.equal(fetched.summary, '摘要 café 日本語');
+    assert.equal(fetched.body, body);
+    assert.equal(fetched.version, 1);
+  } finally {
+    await server.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 21. PUT boundary: same limit (version field and JSON structure included).
+//     Rejection leaves the original article — title, summary, body, id,
+//     createdAt, status and version — and every other draft untouched; a
+//     legal update returns 200, keeps id/createdAt and bumps version once.
+// ---------------------------------------------------------------------------
+test('更新接口大小上限：同一上限，拒绝时原文章与其他草稿完全不变，合法更新版本只增加一次', async () => {
+  const server = await TestServer.start();
+  try {
+    const target = await seed(server, { title: '将被更新', summary: '原摘要', body: '原正文' });
+    const other = await seed(server, { title: '其他草稿', summary: '其他摘要', body: '其他正文' });
+
+    // 恰好上限（version 字段与 JSON 结构一并计入）：200，版本只增加一次。
+    const exact = jsonPayloadOfSize(MAX_REQUEST_BYTES, { title: '上限内新标题', summary: '新摘要', version: 1 });
+    let res = await sendRaw(server, { method: 'PUT', path: `/api/articles/${target.id}`, body: exact });
+    assert.equal(res.status, 200);
+    const updated = JSON.parse(res.body).article;
+    assert.equal(updated.id, target.id);
+    assert.equal(updated.createdAt, target.createdAt);
+    assert.equal(updated.status, 'draft');
+    assert.equal(updated.version, 2);
+    assert.equal(updated.title, '上限内新标题');
+
+    // 超上限一个字节：完整 400；原文章所有字段（含版本）不变，其他草稿不受影响。
+    const over = jsonPayloadOfSize(MAX_REQUEST_BYTES + 1, { title: '超限标题', summary: '超限摘要', version: 2 });
+    res = await sendRaw(server, { method: 'PUT', path: `/api/articles/${target.id}`, body: over });
+    assertOversizeRejected(res);
+    assert.deepEqual(await getArticle(server, target.id), updated);
+    assert.deepEqual(await getArticle(server, other.id), other);
+
+    // 正文自身未到上限、加上其他字段后整份请求才超限：同样拒绝且原文不变。
+    const fat = JSON.stringify({ title: 't', summary: 's', body: 'z'.repeat(MAX_REQUEST_BYTES - 20), version: 2 });
+    assert.ok(Buffer.byteLength(fat, 'utf8') > MAX_REQUEST_BYTES, '整份请求确实超过上限');
+    res = await sendRaw(server, { method: 'PUT', path: `/api/articles/${target.id}`, body: fat });
+    assertOversizeRejected(res);
+    const stored = await getArticle(server, target.id);
+    assert.deepEqual(stored, updated);
+    assert.equal(stored.version, 2, '被拒绝的更新不能推进版本');
+
+    // 合法更新：200，保留原标识与创建时间，版本只增加一次（2→3）。
+    res = await sendRaw(server, {
+      method: 'PUT',
+      path: `/api/articles/${target.id}`,
+      body: JSON.stringify({ title: '再次更新', summary: '', body: '新正文', version: 2 }),
+    });
+    assert.equal(res.status, 200);
+    const again = JSON.parse(res.body).article;
+    assert.equal(again.version, 3);
+    assert.equal(again.id, target.id);
+    assert.equal(again.createdAt, target.createdAt);
+    assert.equal(again.status, 'draft');
+    assert.equal((await server.listArticles()).length, 2, '更新不能另建记录');
+    assert.deepEqual(await getArticle(server, other.id), other);
+  } finally {
+    await server.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 22. Chunked transfer obeys the same limit as a declared Content-Length:
+//     in-limit chunked requests succeed; when an early chunk is still within
+//     the limit and a later chunk pushes the cumulative size over it, the
+//     client still reads a complete 400 with a non-empty error. The same
+//     content sent either way gets the same outcome.
+// ---------------------------------------------------------------------------
+test('分块传输与声明长度同一上限：边界内分块成功，中途超限也能读到完整400，两种方式结果一致', async () => {
+  const server = await TestServer.start();
+  try {
+    // 边界内的合法请求使用分块传输：不能因此被拒绝。
+    const small = JSON.stringify({ title: '分块草稿', summary: '分块摘要', body: '分块正文\n\n第二段 中文' });
+    let res = await sendRaw(server, {
+      method: 'POST', path: '/api/articles',
+      chunks: [small.slice(0, 17), small.slice(17)],
+    });
+    assert.equal(res.status, 201);
+    const created = JSON.parse(res.body).article;
+    assert.equal(created.version, 1);
+    assert.equal(created.body, '分块正文\n\n第二段 中文');
+
+    // 恰好上限的合法请求分多块发送：同样成功。
+    const exact = jsonPayloadOfSize(MAX_REQUEST_BYTES, { title: '分块边界', summary: '' });
+    const exactChunks = [];
+    const step = 512 * 1024;
+    for (let i = 0; i < exact.length; i += step) exactChunks.push(exact.slice(i, i + step));
+    assert.ok(exactChunks.length > 1, '确实分成了多块');
+    res = await sendRaw(server, { method: 'POST', path: '/api/articles', chunks: exactChunks });
+    assert.equal(res.status, 201);
+
+    // 分块发送时前面的内容还在上限内、后续内容才让累计大小超限：
+    // 客户端必须读到完整的 400 响应及非空 error，而不是连接中断或残缺响应。
+    const over = jsonPayloadOfSize(MAX_REQUEST_BYTES + 1, { title: '分块超限', summary: '' });
+    const within = over.slice(0, MAX_REQUEST_BYTES - 1000); // 前段仍在限内
+    const rest = over.slice(MAX_REQUEST_BYTES - 1000); // 后段才把累计推过上限
+    res = await sendRaw(server, { method: 'POST', path: '/api/articles', chunks: [within, rest] });
+    assertOversizeRejected(res);
+    assert.equal((await server.listArticles()).length, 2, '被拒绝的分块新建不能留下记录');
+
+    // 相同内容换一种发送方式结果一致：同一超限内容带 Content-Length 也同样 400。
+    res = await sendRaw(server, { method: 'POST', path: '/api/articles', body: over });
+    assertOversizeRejected(res);
+    // 同一合法内容两种方式都成功：上面分块已 201，换 Content-Length 也 201。
+    res = await sendRaw(server, { method: 'POST', path: '/api/articles', body: small });
+    assert.equal(res.status, 201);
+    assert.equal((await server.listArticles()).length, 3);
+
+    // 更新接口分块超限：同样拿到完整 400，原文章（含版本）保持不变。
+    const before = await getArticle(server, created.id);
+    const overPut = jsonPayloadOfSize(MAX_REQUEST_BYTES + 1, { title: '分块更新超限', summary: '', version: 1 });
+    res = await sendRaw(server, {
+      method: 'PUT', path: `/api/articles/${created.id}`,
+      chunks: [overPut.slice(0, 1000), overPut.slice(1000)],
+    });
+    assertOversizeRejected(res);
+    assert.deepEqual(await getArticle(server, created.id), before);
+  } finally {
+    await server.stop();
   }
 });
 
