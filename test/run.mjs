@@ -1307,6 +1307,226 @@ test('列表先显示新草稿、创建响应后到且等待期间有未保存�
 });
 
 // ---------------------------------------------------------------------------
+// 15d. The create request is persisted as version 1, but while its success
+//      response is parked another page opens that draft, edits title/summary/
+//      body and saves version 2. The deferred initial list is released first,
+//      so the page shows version 2 before the create response arrives. The
+//      late version-1 create result must NOT roll the card back: the card
+//      keeps the newer saved title/summary, other drafts in that list are all
+//      retained, same-title/different-id drafts stay separate, order stays
+//      newest-first, and — with no further input — the form is still cleared
+//      into create mode and the save is reported as success, not failure.
+// ---------------------------------------------------------------------------
+test('创建响应晚到且列表先显示其他页面保存的版本2：卡片不退回版本1，其他草稿保留，表单照常清空', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    // 一篇与版本2最终标题同名但标识不同的旧草稿，再加一篇其他草稿。
+    const seededSameTitle = await seed(server, { title: '第二版标题', summary: '另一页同名第二版', body: 'a' });
+    const seededOther = await seed(server, { title: '其他草稿', summary: '其他摘要', body: 'b' });
+    // deferred：列表请求放行后才发出，服务端按放行时刻（已含版本2）的数据应答。
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'deferred' });
+    try {
+      // capture：创建请求真实落库为版本 1，只有成功响应被扣在页面里。
+      await ui.gateCaptureOn(page);
+      await ui.fill(page, { title: '新建时的标题', summary: '第一版摘要', body: '第一版正文' });
+      await ui.clickSave(page);
+      await ui.waitSavingPending(page, 1);
+      const persisted = await waitForServerArticles(server, 3);
+      const created = persisted.find((a) => a.summary === '第一版摘要');
+      assert.ok(created, '创建请求应已在服务端落库为版本 1');
+      assert.equal(created.version, 1);
+
+      // 另一页面读取这篇草稿，修改标题、摘要、正文并保存为版本 2。
+      const up = await updateOut(server, created.id, {
+        title: '第二版标题',
+        summary: '第二版摘要',
+        body: '第二版正文',
+      }, 1);
+      assert.equal(up.status, 200);
+
+      // 首次列表先返回：卡片显示的是版本 2 的较新已保存内容。
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+      let s = await ui.state(page);
+      assert.equal(s.listCount, 3);
+      const createdCardBefore = s.cards.find((card) => card.summary === '第二版摘要');
+      assert.ok(createdCardBefore, '列表应先显示其他页面保存的版本 2 摘要');
+      assert.equal(createdCardBefore.title, '第二版标题');
+
+      // 版本 1 的创建成功响应随后到达。
+      await ui.releaseSaves(page);
+      await ui.gateOff(page);
+      await ui.waitForStatus(page, '草稿已保存', 'ok');
+      s = await ui.state(page);
+
+      // 迟到的创建结果不能把卡片退回版本 1 的标题或摘要。
+      assert.equal(s.listCount, 3, '同一标识仍只有一张卡片，其他草稿一条都不能丢');
+      assert.equal(s.cards.filter((card) => card.summary === '第一版摘要').length, 0,
+        '卡片不能退回版本 1 的摘要');
+      assert.equal(s.cards.filter((card) => card.title === '新建时的标题').length, 0,
+        '卡片不能退回版本 1 的标题');
+      const createdCardAfter = s.cards.find((card) => card.summary === '第二版摘要');
+      assert.ok(createdCardAfter, '版本 2 的较新已保存内容必须继续显示');
+      assert.equal(createdCardAfter.title, '第二版标题');
+      // 标题相同、标识不同的两篇仍分别保留；顺序继续按创建时间倒序。
+      assert.equal(s.cards.filter((card) => card.title === '第二版标题').length, 2);
+      const apiArticles = await server.listArticles();
+      const expectedTitles = apiArticles
+        .slice()
+        .sort((x, y) => (x.createdAt < y.createdAt ? 1 : x.createdAt > y.createdAt ? -1 : 0))
+        .map((art) => art.title);
+      assert.deepEqual(s.cards.map((card) => card.title), expectedTitles);
+      const expectedSummaries = apiArticles
+        .slice()
+        .sort((x, y) => (x.createdAt < y.createdAt ? 1 : x.createdAt > y.createdAt ? -1 : 0))
+        .map((art) => art.summary);
+      assert.deepEqual(s.cards.map((card) => card.summary), expectedSummaries);
+      const ids = apiArticles.map((a) => a.id);
+      assert.equal(new Set(ids).size, 3);
+      assert.ok(ids.includes(created.id) && ids.includes(seededSameTitle.id) && ids.includes(seededOther.id));
+
+      // 等待期间没有新修改：创建成功后仍清空表单、保留新建入口，不当成失败。
+      assert.deepEqual(s.form, { title: '', summary: '', body: '' });
+      assert.equal(s.formEditing, false);
+      assert.equal(s.bannerHidden, true);
+      assert.equal(s.saveBtnText, '保存草稿');
+      assert.equal(s.statusKind, 'ok');
+
+      // 服务端这篇草稿仍是其他页面保存的版本 2，迟到响应没有改回版本 1 或另建记录。
+      const stored = await getArticle(server, created.id);
+      assert.equal(stored.version, 2);
+      assert.equal(stored.title, '第二版标题');
+      assert.equal(stored.summary, '第二版摘要');
+      assert.equal(stored.body, '第二版正文');
+      assert.equal((await server.listArticles()).length, 3);
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 15e. Same ordering as 15d, but the user keeps editing while the version-1
+//      create response is parked after the list already showed version 2.
+//      When that response arrives the single card stays at version 2 while
+//      the form links to the just-created draft: unsaved inputs are kept and
+//      named, the list never shows them, and the editing baseline remains the
+//      create result's version 1 (NOT the card's version 2 — the user never
+//      loaded the other page's body). A further save therefore PUTs version 1
+//      and is rejected with the ordinary 409, which keeps the input and shows
+//      the newer saved content; nothing is overwritten and no second draft is
+//      created. Explicitly choosing to load the latest content then reads the
+//      current full article and editing continues from version 2.
+// ---------------------------------------------------------------------------
+test('列表先到版本2、创建响应（版本1）后到且期间有未保存输入：表单按版本1关联，再保存走409而非覆盖或另建', async (browser) => {
+  const server = await TestServer.start();
+  try {
+    const page = await ui.openWithListHeld(browser, server.url, { hold: 'deferred' });
+    try {
+      await ui.gateCaptureOn(page);
+      await ui.fill(page, { title: '第一版标题', summary: '第一版摘要', body: '第一版正文' });
+      await ui.clickSave(page);
+      await ui.waitSavingPending(page, 1);
+      const persisted = await waitForServerArticles(server, 1);
+      const created = persisted[0];
+      assert.equal(created.version, 1);
+
+      // 另一页面把同一篇草稿保存为版本 2（标题、摘要、正文都改了）。
+      const v2 = { title: '第二版标题', summary: '第二版摘要', body: '第二版正文' };
+      const up = await updateOut(server, created.id, v2, 1);
+      assert.equal(up.status, 200);
+
+      // 首次列表先到：卡片已经是版本 2。
+      await ui.releaseList(page);
+      await ui.waitListBusy(page, false);
+      let s = await ui.state(page);
+      assert.equal(s.cards[0].title, '第二版标题');
+      assert.equal(s.cards[0].summary, '第二版摘要');
+
+      // 创建响应仍被扣着，用户基于自己创建时的内容继续改摘要和正文（未提交）。
+      await ui.fill(page, { summary: '等待期间改写的摘要', body: '等待期间改写的正文' });
+
+      // 版本 1 的创建成功响应到达。
+      await ui.releaseSaves(page);
+      await ui.gateOff(page);
+      await ui.waitForStatus(page, '尚未保存', 'warn');
+      s = await ui.state(page);
+      assert.match(s.statusText, /摘要、正文|正文、摘要/);
+      // 表单关联到刚创建的同一篇草稿，未保存输入原样保留。
+      assert.equal(s.formEditing, true);
+      assert.equal(s.bannerId, created.id);
+      assert.equal(s.saveBtnText, '保存修改');
+      assert.deepEqual(s.form, {
+        title: '第一版标题',
+        summary: '等待期间改写的摘要',
+        body: '等待期间改写的正文',
+      });
+      // 卡片继续显示版本 2 的已保存内容，绝不显示未提交输入；只有一张“编辑中”卡片。
+      assert.equal(s.listCount, 1);
+      assert.equal(s.cards[0].title, '第二版标题');
+      assert.equal(s.cards[0].summary, '第二版摘要');
+      assert.equal(s.cards.filter((card) => card.editing).length, 1);
+
+      // 再次保存沿用创建结果的版本基准（版本 1）：服务端当前为版本 2，
+      // 应由现有冲突处理拒绝（409），而不是覆盖另一页面的修改或另建草稿。
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '409', 'err');
+      await ui.waitConflictShown(page);
+      s = await ui.state(page);
+      const conflict = await ui.getConflict(page);
+      assert.deepEqual(
+        { title: conflict.mine.title, summary: conflict.mine.summary, body: conflict.mine.body },
+        { title: '第一版标题', summary: '等待期间改写的摘要', body: '等待期间改写的正文' });
+      assert.deepEqual(
+        { title: conflict.saved.title, summary: conflict.saved.summary, body: conflict.saved.body }, v2);
+      // 输入与编辑状态保留，卡片仍是版本 2，服务端未被覆盖、记录数不变。
+      assert.deepEqual(s.form, {
+        title: '第一版标题',
+        summary: '等待期间改写的摘要',
+        body: '等待期间改写的正文',
+      });
+      assert.equal(s.bannerId, created.id);
+      assert.equal(s.cards[0].title, '第二版标题');
+      let stored = await getArticle(server, created.id);
+      assert.equal(stored.version, 2);
+      assert.deepEqual({ title: stored.title, summary: stored.summary, body: stored.body }, v2);
+      assert.equal((await server.listArticles()).length, 1);
+
+      // 用户明确选择载入最新内容：按已有方式重新读取当前完整文章（版本 2）再继续编辑。
+      await ui.clickDiscardLoad(page);
+      await ui.waitLoadedDraft(page);
+      s = await ui.state(page);
+      assert.deepEqual(s.form, { title: v2.title, summary: v2.summary, body: v2.body });
+      assert.equal(s.bannerId, created.id);
+      assert.equal(s.cards[0].title, v2.title);
+
+      // 以版本 2 为新基准保存，更新同一篇草稿到版本 3，不报冲突、不另建。
+      await ui.fill(page, { body: `${v2.body}\n载入后补充一行` });
+      await ui.clickSave(page);
+      await ui.waitForStatus(page, '修改已保存', 'ok');
+      stored = await getArticle(server, created.id);
+      assert.equal(stored.version, 3);
+      assert.equal(stored.id, created.id);
+      assert.equal(stored.createdAt, created.createdAt);
+      assert.equal(stored.body, `${v2.body}\n载入后补充一行`);
+      assert.equal((await server.listArticles()).length, 1);
+    } finally {
+      ui.assertNoPageErrors(page);
+      await browser.closePage(page);
+      await server.stop();
+    }
+  } catch (error) {
+    await server.stop();
+    throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 16. The page saves the draft, then edits and saves it again while the stale
 //     list response is still in flight. That response carries the older
 //     title/summary/version; merging must not roll the card back, must not

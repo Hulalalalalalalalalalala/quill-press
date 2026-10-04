@@ -610,13 +610,27 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           // 草稿进入编辑态，后续“保存修改”按本次响应的版本更新它，不再新建。
           // 列表一律按文章标识区分记录：首次列表结果可能已先到达且包含这篇
           // 草稿（创建在服务端先完成），此时绝不能再次 push——同一标识只保留
-          // 一条，用本次响应的已保存内容更新既有卡片；标题相同但标识不同的
-          // 其他草稿不受影响，仍是各自一条。
+          // 一条；标题相同但标识不同的其他草稿不受影响，仍是各自一条。
           var createIdx = -1;
           for (var j = 0; j < articles.length; j++) {
             if (articles[j] && articles[j].id === article.id) { createIdx = j; break; }
           }
-          if (createIdx >= 0) articles[createIdx] = article; else articles.push(article);
+          if (createIdx < 0) {
+            // 首次列表里没有这篇草稿（或列表尚未返回）：按现有规则新增卡片。
+            articles.push(article);
+          } else if (versionNumberOf(article) >= versionNumberOf(articles[createIdx])) {
+            // 带回的仍是创建时的同一版本（或更旧快照规则下不可能出现的更新
+            // 情况）：用本次创建成功的已保存内容更新这一张卡片。
+            articles[createIdx] = article;
+          }
+          // 否则：首次列表结果已先到达，且同一标识的卡片已经是更新的已保存
+          // 版本——服务端先落库了本次创建（版本 1），响应被扣期间其他页面读取
+          // 同一篇草稿并保存了版本 2，本页首次列表先返回了版本 2。创建确实
+          // 成功了，但迟到的创建结果是更旧的快照，绝不能把卡片从版本 2 退回
+          // 版本 1 的标题、摘要或版本；保留列表中较新的已保存内容，同一份列表
+          // 里的其他草稿也一条都不能丢。
+          // 这里只保护列表卡片：下面表单的编辑基准仍以本次创建响应为准——用户
+          // 一直基于自己创建时的内容继续输入，并没有载入其他页面保存的正文。
           setSaving(false);
           if (hasUnsavedAfterSave(article, submitted)) {
             mergeSavedEditingState(article, submitted, true);
