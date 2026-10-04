@@ -211,6 +211,17 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     return typeof v === 'number' && isFinite(v) ? v : 0;
   }
 
+  // 按文章标识写入列表：同一标识只保留一条（以本次数据为准），不存在才追加。
+  // 首次列表结果可能已包含这篇刚保存的草稿（服务端先保存成功、列表快照后
+  // 到且已含新草稿），此时直接 push 会让同一篇文章出现两张卡片。
+  function upsertArticle(article) {
+    var idx = -1;
+    for (var i = 0; i < articles.length; i++) {
+      if (articles[i] && articles[i].id === article.id) { idx = i; break; }
+    }
+    if (idx >= 0) articles[idx] = article; else articles.push(article);
+  }
+
   // 首次列表结果与本页面状态合并，而不是整体替换：
   // - 本页面已保存成功的文章必须保留；标题相同但标识不同的文章仍是两条
   //   记录，结果带回的其他文章也一并并入；
@@ -311,11 +322,7 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
     };
     // 列表同步为本次载入的已保存内容，使该草稿的标题、摘要与“编辑中”标识
     // 与载入结果一致（载入的可能比列表缓存更新）。
-    var idx = -1;
-    for (var i = 0; i < articles.length; i++) {
-      if (articles[i] && articles[i].id === article.id) { idx = i; break; }
-    }
-    if (idx >= 0) articles[idx] = article; else articles.push(article);
+    upsertArticle(article);
     titleInput.value = article.title == null ? '' : String(article.title);
     summaryInput.value = article.summary == null ? '' : String(article.summary);
     bodyInput.value = article.body == null ? '' : String(article.body);
@@ -594,11 +601,7 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
       .then(function (article) {
         if (!article) return; // 冲突分支已处理
         if (isEdit) {
-          var idx = -1;
-          for (var i = 0; i < articles.length; i++) {
-            if (articles[i] && articles[i].id === article.id) { idx = i; break; }
-          }
-          if (idx >= 0) articles[idx] = article; else articles.push(article);
+          upsertArticle(article);
           render();
           setSaving(false);
           // 保持编辑态：仍是同一篇草稿，可继续修改。
@@ -608,7 +611,9 @@ article.draft.editing{border-color:#175b9c;box-shadow:0 0 0 2px rgba(23,91,156,.
           // 新建成功：列表只显示本次实际保存的内容。若等待响应期间表单又被改过
           // 且未恢复为保存值，绝不能清空这些输入——把表单关联到刚创建的同一篇
           // 草稿进入编辑态，后续“保存修改”按本次响应的版本更新它，不再新建。
-          articles.push(article);
+          // 按标识写入：若首次列表结果已先到达且包含这篇新草稿，只更新那一条，
+          // 同一篇文章绝不能出现两张卡片。
+          upsertArticle(article);
           setSaving(false);
           if (hasUnsavedAfterSave(article, submitted)) {
             mergeSavedEditingState(article, submitted, true);
