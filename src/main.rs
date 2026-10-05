@@ -346,10 +346,13 @@ mod x509 {
     }
 
     /// Name ::= SEQUENCE OF RDN; rendered per RFC 4514 (RDNs reversed,
-    /// multi-valued RDNs joined with '+'). Values of known attribute types
-    /// are emitted as real UTF-8 text so non-ASCII content is preserved
-    /// verbatim; attributes without a known short name use their dotted OID
-    /// and the '#' form carrying the value's full DER encoding in hex.
+    /// multi-valued RDNs joined with '+'). Values with a string decoding are
+    /// emitted as escaped UTF-8 text so non-ASCII content is preserved
+    /// verbatim; a known attribute whose value is another legal DER type
+    /// without a text form here (e.g. postalAddress, a SEQUENCE OF
+    /// DirectoryString) keeps its short name and uses the '#' form carrying
+    /// the value's full, original DER encoding in hex. Attributes without a
+    /// known short name use their dotted OID with the same '#hex' form.
     fn format_name(name: Tlv) -> Result<String, String> {
         let mut rdn_buf = name.content;
         let mut rdns: Vec<String> = Vec::new();
@@ -369,12 +372,27 @@ mod x509 {
                 if !after_value.is_empty() {
                     return Err("trailing data in attribute value".to_string());
                 }
+                // Raw bytes of the complete value TLV (tag, length and
+                // content), sliced straight from the input so a legal
+                // long-form length is preserved byte for byte instead of
+                // being re-encoded.
+                let tlv_len = after_oid.len() - after_value.len();
+                let value_tlv = &after_oid[..tlv_len];
 
                 let oid_arcs = parse_oid(oid.content)?;
-                match oid_short_name(&oid_arcs) {
+                let rendered = match oid_short_name(&oid_arcs) {
                     Some(label) => {
-                        let text = decode_attribute_value(value.tag, value.content)?;
-                        parts.push(format!("{label}={}", escape_value(&text)));
+                        if is_text_string_tag(value.tag) {
+                            let text = decode_attribute_value(value.tag, value.content)?;
+                            format!("{label}={}", escape_value(&text))
+                        } else {
+                            // Known attribute carrying a legal value this
+                            // decoder cannot turn into text (e.g. a
+                            // postalAddress address-line SEQUENCE): keep the
+                            // short name and show the full DER encoding after
+                            // the unescaped '#' marker.
+                            format!("{label}=#{}", hex_upper(value_tlv))
+                        }
                     }
                     None => {
                         // Unknown attribute type: RFC 4514 requires the form
@@ -386,15 +404,10 @@ mod x509 {
                             std::str::from_utf8(value.content)
                                 .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?;
                         }
-                        let tlv_len = after_oid.len() - after_value.len();
-                        let tlv_bytes = &after_oid[..tlv_len];
-                        let mut hex = String::with_capacity(tlv_bytes.len() * 2);
-                        for b in tlv_bytes {
-                            write!(hex, "{b:02X}").unwrap();
-                        }
-                        parts.push(format!("{}=#{hex}", arcs_to_string(&oid_arcs)));
+                        format!("{}=#{}", arcs_to_string(&oid_arcs), hex_upper(value_tlv))
                     }
-                }
+                };
+                parts.push(rendered);
             }
             if parts.is_empty() {
                 return Err("empty RelativeDistinguishedName".to_string());
@@ -493,6 +506,34 @@ mod x509 {
             _ => return None,
         };
         Some(name)
+    }
+
+    /// Tags for which `decode_attribute_value` has a real text decoding.
+    /// Known attributes carrying any other tag are legal DER but have no text
+    /// form here, so they are rendered through the '#' hex form instead.
+    fn is_text_string_tag(tag: u8) -> bool {
+        matches!(
+            tag,
+            0x0C // UTF8String
+            | 0x12 // NumericString
+            | 0x13 // PrintableString
+            | 0x14 // TeletexString (T.61)
+            | 0x16 // IA5String
+            | 0x1A // VisibleString
+            | 0x1B // GeneralString
+            | 0x1C // UniversalString
+            | 0x1E // BMPString
+        )
+    }
+
+    /// Upper-case hex of a slice, used for the '#' encoding of a value's
+    /// complete DER TLV.
+    fn hex_upper(bytes: &[u8]) -> String {
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            write!(hex, "{b:02X}").unwrap();
+        }
+        hex
     }
 
     /// Decode a DirectoryString-style attribute value into UTF-8 text.

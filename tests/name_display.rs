@@ -26,6 +26,7 @@ const FIXED_NOT_AFTER: &str = "2027-01-15T09:30:00Z";
 const CN: &[u64] = &[2, 5, 4, 3];
 const O: &[u64] = &[2, 5, 4, 10];
 const C: &[u64] = &[2, 5, 4, 6];
+const POSTAL_ADDRESS: &[u64] = &[2, 5, 4, 17];
 
 // ----- Success cases -------------------------------------------------------
 
@@ -129,6 +130,85 @@ fn subject_and_issuer_render_independently() {
         &out,
         "CN=subject.example,O=测试",
         "CN=Example CA+1.2.3.4=#0C03616263",
+    );
+}
+
+// ----- Success cases: known attribute with a non-text value ----------------
+
+#[test]
+fn known_postal_address_sequence_keeps_short_name_and_full_der_hex() {
+    // postalAddress (2.5.4.17) is a SEQUENCE OF address lines, not a string:
+    // a sequence holding just UTF8String "abc" must render with the short
+    // name and the whole value TLV in hex — 30050C03616263 — not reject the
+    // certificate for an unsupported value type.
+    let value = seq(&utf8_value("abc")); // SEQUENCE { UTF8String "abc" }
+    let subject = name(&[rdn(&[atv(POSTAL_ADDRESS, &value)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("postal-basic", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "postalAddress=#30050C03616263", "CN=Test CA");
+}
+
+#[test]
+fn known_non_text_value_preserves_long_form_length_in_hex() {
+    // The inner UTF8String alone needs the long form (128 bytes); the hex is
+    // the original value TLV verbatim, length bytes and all, never
+    // re-encoded or reduced to just the content.
+    let line = tlv(0x0C, "a".repeat(128).as_bytes());
+    let value = seq(&line);
+    let subject = name(&[rdn(&[atv(POSTAL_ADDRESS, &value)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("postal-longlen", &build_cert(&subject, &issuer));
+
+    let mut inner_hex = String::from("0C8180");
+    inner_hex.push_str(&"61".repeat(128));
+    let mut expected = String::from("308183");
+    expected.push_str(&inner_hex);
+    assert_success(&out, &format!("postalAddress=#{expected}"), "CN=Test CA");
+}
+
+#[test]
+fn non_text_known_value_mixes_with_text_unknown_and_stays_in_multivalue_rdn() {
+    // One multi-valued RDN mixes a text CN, a hex postalAddress and a hex
+    // unknown OID: joined with '+', group kept intact, order preserved. The
+    // CJK attribute in another group stays raw UTF-8; groups are reversed.
+    let postal = seq(&utf8_value("abc"));
+    let subject = name(&[
+        rdn(&[atv_utf8(C, "CN")]),
+        rdn(&[atv_utf8(O, "示例公司")]),
+        rdn(&[
+            atv_utf8(CN, "example.com"),
+            atv(POSTAL_ADDRESS, &postal),
+            atv_utf8(&[1, 2, 3, 4], "def"),
+        ]),
+    ]);
+    let issuer = name(&[rdn(&[atv(POSTAL_ADDRESS, &postal)])]);
+    let (out, _cert) = run_inspect("postal-mixed", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "CN=example.com+postalAddress=#30050C03616263+1.2.3.4=#0C03646566,O=示例公司,C=CN",
+        "postalAddress=#30050C03616263",
+    );
+}
+
+#[test]
+fn repeated_non_text_known_attributes_are_all_kept() {
+    // postalAddress may appear more than once; each occurrence is emitted,
+    // even within a single multi-valued RDN.
+    let line1 = seq(&utf8_value("abc"));
+    let line2 = seq(&utf8_value("de"));
+    let subject = name(&[rdn(&[
+        atv(POSTAL_ADDRESS, &line1),
+        atv(POSTAL_ADDRESS, &line2),
+    ])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("postal-repeat", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "postalAddress=#30050C03616263+postalAddress=#30040C026465",
+        "CN=Test CA",
     );
 }
 
@@ -411,6 +491,12 @@ fn atv(arcs: &[u64], value: &[u8]) -> Vec<u8> {
 
 fn atv_utf8(arcs: &[u64], text: &str) -> Vec<u8> {
     atv(arcs, &tlv(0x0C, text.as_bytes()))
+}
+
+/// A bare UTF8String value TLV (no attribute wrapper), used as an element
+/// inside a constructed value such as a postalAddress SEQUENCE.
+fn utf8_value(text: &str) -> Vec<u8> {
+    tlv(0x0C, text.as_bytes())
 }
 
 fn oid(arcs: &[u64]) -> Vec<u8> {
