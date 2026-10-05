@@ -220,40 +220,104 @@ mod x509 {
         let (issuer, t) = read_tagged(t, TAG_SEQUENCE, "issuer")?;
         let (validity, t) = read_tagged(t, TAG_SEQUENCE, "validity")?;
         let (subject, t) = read_tagged(t, TAG_SEQUENCE, "subject")?;
-        let (spki, mut t) = read_tagged(t, TAG_SEQUENCE, "subjectPublicKeyInfo")?;
+        let (spki, t_after_spki) = read_tagged(t, TAG_SEQUENCE, "subjectPublicKeyInfo")?;
         check_spki(spki)?;
-        // issuerUniqueID [1] and subjectUniqueID [2] are optional context
-        // fields; they must still each be a complete TLV. The extensions
-        // field [3] EXPLICIT is decoded in full rather than skipped: see
-        // `check_extensions`.
+        // Optional tail of TBSCertificate, in a fixed order:
+        //   issuerUniqueID  [1] IMPLICIT BIT STRING  (v2/v3, at most once)
+        //   subjectUniqueID [2] IMPLICIT BIT STRING  (v2/v3, at most once)
+        //   extensions      [3] EXPLICIT             (v3 only, at most once,
+        //                                             and the last field)
+        // Nothing else may follow subjectPublicKeyInfo: fields cannot be
+        // skipped, reordered or dropped. The extensions interior is decoded in
+        // full by `check_extensions`; the unique IDs carry BIT STRING content
+        // directly (implicit tagging), validated by `check_bit_string`.
+        let mut t = t_after_spki;
+        let mut issuer_uid_seen = false;
+        let mut subject_uid_seen = false;
         let mut extensions_present = false;
         while !t.is_empty() {
             let tag_hint = t.first().copied();
-            let (field, rest) = read_tlv(t).map_err(|e| {
+            let (field, rest) = read_tlv(t).map_err(|e| match tag_hint {
+                Some(0x81) => format!("issuerUniqueID: {e}"),
+                Some(0x82) => format!("subjectUniqueID: {e}"),
                 // A truncated field whose tag is already readable can still
                 // be located: tag 0xA3 is the extensions field.
-                if tag_hint == Some(0xA3) {
-                    format!("extensions field: {e}")
-                } else {
-                    e
-                }
+                Some(0xA3) => format!("extensions field: {e}"),
+                _ => e,
             })?;
-            if field.tag == 0xA3 {
-                if extensions_present {
-                    return Err("duplicate extensions field".to_string());
-                }
-                extensions_present = true;
-                if version != 2 {
-                    let name = if version == 0 {
-                        "v1"
+            match field.tag {
+                0x81 | 0x82 => {
+                    let what = if field.tag == 0x81 {
+                        "issuerUniqueID"
                     } else {
-                        "v2"
+                        "subjectUniqueID"
+                    };
+                    if version < 1 {
+                        return Err(format!(
+                            "{what} is only allowed in v2 or v3 certificates, this is v1"
+                        ));
+                    }
+                    if extensions_present {
+                        return Err(format!(
+                            "{what} must appear before the extensions field, \
+                             which is the last field of tbsCertificate"
+                        ));
+                    }
+                    if field.tag == 0x81 {
+                        if issuer_uid_seen {
+                            return Err("duplicate issuerUniqueID field".to_string());
+                        }
+                        if subject_uid_seen {
+                            return Err(
+                                "issuerUniqueID must appear before subjectUniqueID".to_string()
+                            );
+                        }
+                        issuer_uid_seen = true;
+                    } else if subject_uid_seen {
+                        return Err("duplicate subjectUniqueID field".to_string());
+                    } else {
+                        subject_uid_seen = true;
+                    }
+                    check_bit_string(field.content, what)?;
+                }
+                0xA1 | 0xA2 => {
+                    let what = if field.tag == 0xA1 {
+                        "issuerUniqueID"
+                    } else {
+                        "subjectUniqueID"
                     };
                     return Err(format!(
-                        "extensions are only allowed in v3 certificates, this is {name}"
+                        "{what} must be an implicitly tagged primitive BIT STRING \
+                         (tag 0x{:02X}); constructed tag 0x{:02X} is an explicit wrapper \
+                         and is not allowed",
+                        field.tag - 0x20,
+                        field.tag
                     ));
                 }
-                check_extensions(field.content)?;
+                0xA3 => {
+                    if extensions_present {
+                        return Err("duplicate extensions field".to_string());
+                    }
+                    if version != 2 {
+                        let name = if version == 0 {
+                            "v1"
+                        } else {
+                            "v2"
+                        };
+                        return Err(format!(
+                            "extensions are only allowed in v3 certificates, this is {name}"
+                        ));
+                    }
+                    check_extensions(field.content)?;
+                    extensions_present = true;
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected field after subjectPublicKeyInfo (tag 0x{other:02X}): \
+                         only issuerUniqueID [1], subjectUniqueID [2] and extensions [3] \
+                         are allowed there, and extensions must be last"
+                    ));
+                }
             }
             t = rest;
         }
