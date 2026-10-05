@@ -105,6 +105,18 @@ mod x509 {
         content: &'a [u8],
     }
 
+    /// The compared components of an AlgorithmIdentifier: the raw OID
+    /// content bytes (already proven to be a complete, shortest DER
+    /// encoding) and, when present, the full DER bytes (tag, length and
+    /// content) of the single parameter value, sliced straight from the
+    /// certificate. Absent parameters are `None`; an explicit NULL is
+    /// `Some`, so the two representations compare unequal.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct AlgorithmId<'a> {
+        oid: &'a [u8],
+        params: Option<&'a [u8]>,
+    }
+
     const TAG_INTEGER: u8 = 0x02;
     const TAG_BIT_STRING: u8 = 0x03;
     const TAG_OCTET_STRING: u8 = 0x04;
@@ -186,7 +198,13 @@ mod x509 {
 
         let c = cert.content;
         let (tbs, c) = read_tagged(c, TAG_SEQUENCE, "tbsCertificate")?;
-        let (_sig_alg, c) = read_tagged(c, TAG_SEQUENCE, "signatureAlgorithm")?;
+        let (outer_sig_alg, c) =
+            read_tagged(c, TAG_SEQUENCE, "outer signatureAlgorithm")?;
+        // The outer AlgorithmIdentifier is validated before the signature is
+        // read so a corrupt one is reported as a damaged outer identifier
+        // rather than as some unrelated parse failure further on.
+        let outer_alg = parse_algorithm_identifier(outer_sig_alg)
+            .map_err(|e| format!("outer signature algorithm: {e}"))?;
         let (sig_value, c) = read_tlv(c)?;
         if sig_value.tag != TAG_BIT_STRING {
             return Err("signature must be a BIT STRING".to_string());
@@ -216,7 +234,20 @@ mod x509 {
 
         let (serial, t3) = read_tagged(t, TAG_INTEGER, "serialNumber")?;
         let t = t3;
-        let (_tbs_sig, t) = read_tagged(t, TAG_SEQUENCE, "tbs signatureAlgorithm")?;
+        let (tbs_sig_alg, t3) = read_tagged(t, TAG_SEQUENCE, "tbs signatureAlgorithm")?;
+        let tbs_alg = parse_algorithm_identifier(tbs_sig_alg)
+            .map_err(|e| format!("tbs signature algorithm: {e}"))?;
+        let t = t3;
+        // RFC 5280 4.1.1.2/4.1.2.3: the signatureAlgorithm field inside
+        // tbsCertificate must be identical to the outer signatureAlgorithm
+        // field — same algorithm OID and the same parameter representation.
+        // An absent parameter and an explicit NULL differ, and parameters
+        // present on only one side differ, even when the OIDs agree.
+        if outer_alg != tbs_alg {
+            return Err(
+                "outer and tbsCertificate signature algorithms do not match".to_string()
+            );
+        }
         let (issuer, t) = read_tagged(t, TAG_SEQUENCE, "issuer")?;
         let (validity, t) = read_tagged(t, TAG_SEQUENCE, "validity")?;
         let (subject, t) = read_tagged(t, TAG_SEQUENCE, "subject")?;
@@ -427,7 +458,8 @@ mod x509 {
             TAG_SEQUENCE,
             "subjectPublicKeyInfo algorithm identifier",
         )?;
-        check_algorithm_identifier(alg)?;
+        parse_algorithm_identifier(alg)
+            .map_err(|e| format!("subjectPublicKeyInfo algorithm: {e}"))?;
         let (key, rest) = read_tagged(rest, TAG_BIT_STRING, "subjectPublicKey")?;
         check_bit_string(key.content, "subjectPublicKey")?;
         if !rest.is_empty() {
@@ -439,21 +471,39 @@ mod x509 {
     /// AlgorithmIdentifier ::= SEQUENCE {
     ///   algorithm  OBJECT IDENTIFIER,
     ///   parameters ANY DEFINED BY algorithm OPTIONAL }
-    /// The parameters, if present, must be exactly one complete DER TLV;
-    /// absent parameters and an explicit NULL are both accepted. The
-    /// parameter content is not interpreted for any particular algorithm.
-    fn check_algorithm_identifier(alg: Tlv) -> Result<(), String> {
+    ///
+    /// Parse one identifier in full and return exactly what is needed to
+    /// compare two of them: the (validated) OID content bytes and the full
+    /// raw DER bytes of the single parameter value when one is present.
+    ///
+    /// Rejects an empty SEQUENCE, a first element whose tag is not OID, an
+    /// empty or truncated OID, a non-minimal OID arc encoding, a truncated
+    /// parameter, and any second element after the optional parameter. The
+    /// parameter, if present, must be one complete DER TLV but is otherwise
+    /// not interpreted — NULL is common, yet any other single decodable
+    /// value (and an unknown algorithm OID) is accepted.
+    fn parse_algorithm_identifier(alg: Tlv<'_>) -> Result<AlgorithmId<'_>, String> {
         let (oid, rest) = read_tagged(alg.content, TAG_OID, "algorithm OID")?;
         parse_oid(oid.content).map_err(|e| format!("algorithm OID: {e}"))?;
         if rest.is_empty() {
-            return Ok(());
+            return Ok(AlgorithmId {
+                oid: oid.content,
+                params: None,
+            });
         }
-        let (_params, after) =
+        let (_param, after) =
             read_tlv(rest).map_err(|e| format!("algorithm parameters: {e}"))?;
         if !after.is_empty() {
             return Err("multiple algorithm parameters".to_string());
         }
-        Ok(())
+        // Exactly one complete TLV fills the rest of the SEQUENCE: `rest`
+        // itself is that value's full DER encoding (tag, length, content),
+        // sliced straight from the certificate so two parameter encodings can
+        // be compared byte for byte.
+        Ok(AlgorithmId {
+            oid: oid.content,
+            params: Some(rest),
+        })
     }
 
     /// Validate the DER content of a BIT STRING: one leading byte counting
