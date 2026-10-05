@@ -26,6 +26,12 @@ const FIXED_NOT_AFTER: &str = "2027-01-15T09:30:00Z";
 const CN: &[u64] = &[2, 5, 4, 3];
 const O: &[u64] = &[2, 5, 4, 10];
 const C: &[u64] = &[2, 5, 4, 6];
+const POSTAL_ADDRESS: &[u64] = &[2, 5, 4, 17];
+const POSTAL_CODE: &[u64] = &[2, 5, 4, 18];
+
+// The spec example: a SEQUENCE containing only UTF8String "abc", with its
+// complete DER encoding.
+const POSTAL_ADDRESS_ABC_HEX: &str = "30050C03616263";
 
 // ----- Success cases -------------------------------------------------------
 
@@ -130,6 +136,113 @@ fn subject_and_issuer_render_independently() {
         "CN=subject.example,O=测试",
         "CN=Example CA+1.2.3.4=#0C03616263",
     );
+}
+
+#[test]
+fn known_attribute_with_sequence_value_keeps_short_name_and_shows_der_hex() {
+    // The exact spec example: postalAddress (2.5.4.17) is a known attribute
+    // whose value is a SEQUENCE { UTF8String "abc" } rather than a string. It
+    // must render as postalAddress=#30050C03616263 — tag 0x30, length 0x05
+    // and content verbatim — instead of rejecting the whole certificate.
+    let value = seq(&tlv(0x0C, b"abc"));
+    assert_eq!(hex(&value), POSTAL_ADDRESS_ABC_HEX);
+    let subject = name(&[rdn(&[atv(POSTAL_ADDRESS, &value)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("known-sequence", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "postalAddress=#30050C03616263", "CN=Test CA");
+}
+
+#[test]
+fn known_non_string_value_applies_to_issuer_as_well() {
+    // The same rule independently governs the Issuer name.
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[
+        rdn(&[atv(POSTAL_ADDRESS, &seq(&tlv(0x0C, b"abc")))]),
+        rdn(&[atv_utf8(CN, "Test CA")]),
+    ]);
+    let (out, _cert) = run_inspect("known-sequence-issuer", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=subject.example", "CN=Test CA,postalAddress=#30050C03616263");
+}
+
+#[test]
+fn known_non_string_value_preserves_long_form_length() {
+    // A legal long-form length in the value TLV must be carried byte for byte
+    // after '#', not collapsed and not rebuilt from the parsed content.
+    let value = tlv(0x04, &vec![0x41u8; 128]); // postalCode as OCTET STRING
+    let subject = name(&[rdn(&[atv(POSTAL_CODE, &value)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("known-longlen", &build_cert(&subject, &issuer));
+
+    let mut expected = String::from("postalCode=#048180");
+    expected.push_str(&"41".repeat(128));
+    assert_success(&out, &expected, "CN=Test CA");
+}
+
+#[test]
+fn text_hex_and_unknown_values_mix_without_splitting_multivalued_rdn() {
+    // One multi-valued RDN mixes a text value (CN), a known attribute shown as
+    // hex (postalAddress SEQUENCE) and an unknown attribute shown as hex
+    // (1.2.3.4). The group stays joined with '+'; a preceding text RDN and a
+    // repeated text CN in another RDN keep their order after reversal.
+    let subject = name(&[
+        rdn(&[atv_utf8(C, "CN")]),
+        rdn(&[atv_utf8(CN, "one"), atv_utf8(CN, "two")]),
+        rdn(&[
+            atv_utf8(CN, "example.com"),
+            atv(POSTAL_ADDRESS, &seq(&tlv(0x0C, b"abc"))),
+            atv_utf8(&[1, 2, 3, 4], "abc"),
+        ]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("known-mixed", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        &format!(
+            "CN=example.com+postalAddress=#{POSTAL_ADDRESS_ABC_HEX}+1.2.3.4=#0C03616263,\
+             CN=one+CN=two,C=CN"
+        ),
+        "CN=Test CA",
+    );
+}
+
+#[test]
+fn known_attribute_with_bad_string_is_still_rejected_not_hexified() {
+    // A supported string type that fails to decode must never be salvaged by
+    // the hex fallback: invalid UTF-8 in a known attribute is still corrupt.
+    let bad_value = tlv(0x0C, &[0xFF, 0xFE]);
+    let subject = name(&[rdn(&[atv(POSTAL_ADDRESS, &bad_value)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("known-bad-string", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+}
+
+#[test]
+fn truncated_known_non_string_value_is_rejected() {
+    // The non-text value's SEQUENCE header announces five content bytes but
+    // only four follow; hex display must not mask the truncation.
+    let mut inner = oid(POSTAL_ADDRESS);
+    inner.extend_from_slice(&[0x30, 0x05, 0x0C, 0x02, 0xAB]); // len 5, 4 present
+    let subject = name(&[rdn(&[seq(&inner)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("known-truncated", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+}
+
+#[test]
+fn known_non_string_value_with_extra_field_is_rejected() {
+    // Two value TLVs inside one AttributeTypeAndValue stay illegal even when
+    // the first value would render as hex.
+    let two_values = concat(&[&seq(&tlv(0x0C, b"abc")), &tlv(0x05, &[])]);
+    let subject = name(&[rdn(&[atv(POSTAL_ADDRESS, &two_values)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("known-extra-field", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
 }
 
 #[test]
@@ -467,4 +580,13 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
         out.extend_from_slice(part);
     }
     out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        write!(s, "{b:02X}").unwrap();
+    }
+    s
 }

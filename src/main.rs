@@ -347,9 +347,12 @@ mod x509 {
 
     /// Name ::= SEQUENCE OF RDN; rendered per RFC 4514 (RDNs reversed,
     /// multi-valued RDNs joined with '+'). Values of known attribute types
-    /// are emitted as real UTF-8 text so non-ASCII content is preserved
-    /// verbatim; attributes without a known short name use their dotted OID
-    /// and the '#' form carrying the value's full DER encoding in hex.
+    /// are emitted as real UTF-8 text (non-ASCII content preserved verbatim)
+    /// when their tag has a text decoder; a known type carrying any other
+    /// readable DER value (e.g. postalAddress as a SEQUENCE) keeps its short
+    /// name and uses the '#' form carrying the value's full DER encoding in
+    /// hex. Attributes without a known short name use their dotted OID with
+    /// the same '#' form.
     fn format_name(name: Tlv) -> Result<String, String> {
         let mut rdn_buf = name.content;
         let mut rdns: Vec<String> = Vec::new();
@@ -373,8 +376,19 @@ mod x509 {
                 let oid_arcs = parse_oid(oid.content)?;
                 match oid_short_name(&oid_arcs) {
                     Some(label) => {
-                        let text = decode_attribute_value(value.tag, value.content)?;
-                        parts.push(format!("{label}={}", escape_value(&text)));
+                        if is_text_value_tag(value.tag) {
+                            // Supported string type: decode to escaped text.
+                            // A decode failure (e.g. invalid UTF-8) means the
+                            // certificate is corrupt; it must not be salvaged
+                            // by falling back to the hex form.
+                            let text = decode_attribute_value(value.tag, value.content)?;
+                            parts.push(format!("{label}={}", escape_value(&text)));
+                        } else {
+                            // Known type but a legal value with no text decoder
+                            // (SEQUENCE, OCTET STRING, ...): keep the short name
+                            // and show the full original DER encoding as '#'-hex.
+                            parts.push(format!("{label}=#{}", value_hex(after_oid, after_value)));
+                        }
                     }
                     None => {
                         // Unknown attribute type: RFC 4514 requires the form
@@ -386,12 +400,7 @@ mod x509 {
                             std::str::from_utf8(value.content)
                                 .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?;
                         }
-                        let tlv_len = after_oid.len() - after_value.len();
-                        let tlv_bytes = &after_oid[..tlv_len];
-                        let mut hex = String::with_capacity(tlv_bytes.len() * 2);
-                        for b in tlv_bytes {
-                            write!(hex, "{b:02X}").unwrap();
-                        }
+                        let hex = value_hex(after_oid, after_value);
                         parts.push(format!("{}=#{hex}", arcs_to_string(&oid_arcs)));
                     }
                 }
@@ -403,6 +412,29 @@ mod x509 {
         }
         rdns.reverse();
         Ok(rdns.join(","))
+    }
+
+    /// Uppercase hex of one complete value TLV, sliced straight from the
+    /// input bytes (`around` ends at `rest`). The original tag and length
+    /// bytes survive verbatim, including a legal long-form length; nothing is
+    /// re-encoded and content alone is never emitted.
+    fn value_hex(around: &[u8], rest: &[u8]) -> String {
+        let tlv_len = around.len() - rest.len();
+        let mut hex = String::with_capacity(tlv_len * 2);
+        for b in &around[..tlv_len] {
+            write!(hex, "{b:02X}").unwrap();
+        }
+        hex
+    }
+
+    /// Tags whose attribute values have a direct text decoding in
+    /// `decode_attribute_value`. Every other tag that `read_tlv` accepts is a
+    /// legal non-text value for display purposes and is rendered as '#'-hex.
+    fn is_text_value_tag(tag: u8) -> bool {
+        matches!(
+            tag,
+            0x0C | 0x12 | 0x13 | 0x14 | 0x16 | 0x1A | 0x1B | 0x1C | 0x1E
+        )
     }
 
     fn parse_oid(content: &[u8]) -> Result<Vec<u64>, String> {
