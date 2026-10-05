@@ -278,8 +278,9 @@ mod x509 {
     }
 
     /// Name ::= SEQUENCE OF RDN; rendered per RFC 4514 (RDNs reversed,
-    /// multi-valued RDNs joined with '+'). Values are emitted as real UTF-8
-    /// text so non-ASCII content is preserved verbatim.
+    /// multi-valued RDNs joined with '+'). Values of known attribute types
+    /// are emitted as real UTF-8 text so non-ASCII content is preserved
+    /// verbatim; unknown types keep their full DER encoding after '#'.
     fn format_name(name: Tlv) -> Result<String, String> {
         let mut rdn_buf = name.content;
         let mut rdns: Vec<String> = Vec::new();
@@ -301,11 +302,30 @@ mod x509 {
                 }
 
                 let oid_arcs = parse_oid(oid.content)?;
-                let label = oid_short_name(&oid_arcs)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| arcs_to_string(&oid_arcs));
-                let text = decode_attribute_value(value.tag, value.content)?;
-                parts.push(format!("{label}={}", escape_value(&text)));
+                let part = match oid_short_name(&oid_arcs) {
+                    Some(label) => {
+                        let text = decode_attribute_value(value.tag, value.content)?;
+                        format!("{label}={}", escape_value(&text))
+                    }
+                    None => {
+                        // Unknown attribute type (RFC 4514 section 2.4):
+                        // the value is shown as '#' followed by the hex of
+                        // its complete DER encoding, never as decoded text.
+                        // Malformed content is still rejected.
+                        if value.tag == 0x0C {
+                            std::str::from_utf8(value.content)
+                                .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?;
+                        }
+                        let raw = &after_oid[..after_oid.len() - after_value.len()];
+                        let mut hex = String::with_capacity(1 + raw.len() * 2);
+                        hex.push('#');
+                        for b in raw {
+                            write!(hex, "{b:02X}").unwrap();
+                        }
+                        format!("{}={hex}", arcs_to_string(&oid_arcs))
+                    }
+                };
+                parts.push(part);
             }
             if parts.is_empty() {
                 return Err("empty RelativeDistinguishedName".to_string());
