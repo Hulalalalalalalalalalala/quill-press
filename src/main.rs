@@ -107,6 +107,8 @@ mod x509 {
 
     const TAG_INTEGER: u8 = 0x02;
     const TAG_BIT_STRING: u8 = 0x03;
+    const TAG_OCTET_STRING: u8 = 0x04;
+    const TAG_BOOLEAN: u8 = 0x01;
     const TAG_OID: u8 = 0x06;
     const TAG_SEQUENCE: u8 = 0x30;
     const TAG_SET: u8 = 0x31;
@@ -201,14 +203,15 @@ mod x509 {
         //   issuer, validity, subject, subjectPublicKeyInfo, ... }
         let t = tbs.content;
         let (first, t2) = read_tlv(t)?;
-        let t = if first.tag == 0xA0 {
-            let (version, vrest) = read_tagged(first.content, TAG_INTEGER, "version")?;
-            if !vrest.is_empty() || version.content.len() != 1 || version.content[0] > 2 {
+        let (version, t) = if first.tag == 0xA0 {
+            let (ver, vrest) = read_tagged(first.content, TAG_INTEGER, "version")?;
+            if !vrest.is_empty() || ver.content.len() != 1 || ver.content[0] > 2 {
                 return Err("invalid certificate version".to_string());
             }
-            t2
+            (ver.content[0], t2)
         } else {
-            t // No explicit version: v1 certificate.
+            // No explicit version: v1 certificate.
+            (0u8, t)
         };
 
         let (serial, t3) = read_tagged(t, TAG_INTEGER, "serialNumber")?;
@@ -219,10 +222,39 @@ mod x509 {
         let (subject, t) = read_tagged(t, TAG_SEQUENCE, "subject")?;
         let (spki, mut t) = read_tagged(t, TAG_SEQUENCE, "subjectPublicKeyInfo")?;
         check_spki(spki)?;
-        // Remaining fields (issuerUniqueID, subjectUniqueID, extensions, ...)
-        // are optional; they must still each be well-formed TLVs.
+        // issuerUniqueID [1] and subjectUniqueID [2] are optional context
+        // fields; they must still each be a complete TLV. The extensions
+        // field [3] EXPLICIT is decoded in full rather than skipped: see
+        // `check_extensions`.
+        let mut extensions_present = false;
         while !t.is_empty() {
-            let (_, rest) = read_tlv(t)?;
+            let tag_hint = t.first().copied();
+            let (field, rest) = read_tlv(t).map_err(|e| {
+                // A truncated field whose tag is already readable can still
+                // be located: tag 0xA3 is the extensions field.
+                if tag_hint == Some(0xA3) {
+                    format!("extensions field: {e}")
+                } else {
+                    e
+                }
+            })?;
+            if field.tag == 0xA3 {
+                if extensions_present {
+                    return Err("duplicate extensions field".to_string());
+                }
+                extensions_present = true;
+                if version != 2 {
+                    let name = if version == 0 {
+                        "v1"
+                    } else {
+                        "v2"
+                    };
+                    return Err(format!(
+                        "extensions are only allowed in v3 certificates, this is {name}"
+                    ));
+                }
+                check_extensions(field.content)?;
+            }
             t = rest;
         }
 
@@ -246,6 +278,79 @@ mod x509 {
             not_before,
             not_after,
         })
+    }
+
+    /// Validate the content of the extensions field, i.e. the bytes wrapped
+    /// by `[3] EXPLICIT`:
+    ///
+    /// ```text
+    /// Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension
+    /// Extension  ::= SEQUENCE {
+    ///   extnID    OBJECT IDENTIFIER,
+    ///   critical  BOOLEAN DEFAULT FALSE,
+    ///   extnValue OCTET STRING }
+    /// ```
+    ///
+    /// The wrapper must contain exactly one non-empty Extensions SEQUENCE.
+    /// Every extension must contain its OID and OCTET STRING in that order,
+    /// with at most one (DER-encoded) BOOLEAN between them and nothing after.
+    /// Extension contents are never interpreted: unknown but well-formed
+    /// extension OIDs are accepted and `critical: TRUE` is not a failure.
+    fn check_extensions(wrapper: &[u8]) -> Result<(), String> {
+        let (list, rest) = read_tagged(wrapper, TAG_SEQUENCE, "extensions")?;
+        if !rest.is_empty() {
+            return Err("extensions wrapper contains data after the Extensions SEQUENCE".to_string());
+        }
+        if list.content.is_empty() {
+            return Err("extensions SEQUENCE is empty".to_string());
+        }
+
+        let mut buf = list.content;
+        while !buf.is_empty() {
+            let (ext, rest) = read_tagged(buf, TAG_SEQUENCE, "extension")?;
+            buf = rest;
+
+            let (oid, after_oid) = read_tagged(ext.content, TAG_OID, "extension OID")?;
+            parse_oid(oid.content).map_err(|e| format!("extension OID: {e}"))?;
+
+            // critical is optional; whatever stands between the OID and the
+            // OCTET STRING must be exactly one BOOLEAN if it is present.
+            let (maybe_bool, after_critical) = read_tlv(after_oid)
+                .map_err(|e| format!("extension after OID: {e}"))?;
+            let (octets, after_octets) = if maybe_bool.tag == TAG_BOOLEAN {
+                match maybe_bool.content {
+                    [0xFF] => {}
+                    [0x00] => {
+                        return Err(
+                            "extension critical: explicit DER encoding of DEFAULT FALSE is not allowed"
+                                .to_string()
+                        )
+                    }
+                    _ => {
+                        return Err(
+                            "extension critical: invalid DER encoding of BOOLEAN".to_string()
+                        )
+                    }
+                }
+                read_tagged(after_critical, TAG_OCTET_STRING, "extension value")?
+            } else {
+                // Not a BOOLEAN: this element must itself be the extnValue.
+                if maybe_bool.tag != TAG_OCTET_STRING {
+                    return Err(format!(
+                        "extension must contain a critical BOOLEAN then an OCTET STRING, \
+                         got tag 0x{:02X}",
+                        maybe_bool.tag
+                    ));
+                }
+                (maybe_bool, after_critical)
+            };
+            // An empty OCTET STRING is legal; its bytes are not interpreted.
+            let _ = octets.content;
+            if !after_octets.is_empty() {
+                return Err("trailing data in extension".to_string());
+            }
+        }
+        Ok(())
     }
 
     /// SubjectPublicKeyInfo ::= SEQUENCE {
