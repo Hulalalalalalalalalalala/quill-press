@@ -222,38 +222,114 @@ mod x509 {
         let (subject, t) = read_tagged(t, TAG_SEQUENCE, "subject")?;
         let (spki, mut t) = read_tagged(t, TAG_SEQUENCE, "subjectPublicKeyInfo")?;
         check_spki(spki)?;
-        // issuerUniqueID [1] and subjectUniqueID [2] are optional context
-        // fields; they must still each be a complete TLV. The extensions
-        // field [3] EXPLICIT is decoded in full rather than skipped: see
-        // `check_extensions`.
+        // TBSCertificate tail, in strict X.509 order:
+        //   issuerUniqueID  [1] IMPLICIT BIT STRING OPTIONAL,
+        //   subjectUniqueID [2] IMPLICIT BIT STRING OPTIONAL,
+        //   extensions      [3] EXPLICIT Extensions  OPTIONAL
+        // The unique IDs exist only from v2 on, each at most once and [1]
+        // must precede [2]; extensions are v3-only and, when present, close
+        // the field list. No other element may follow subjectPublicKeyInfo,
+        // and an intact outer length is never a reason to skip a bad tail
+        // field: every one of them is decoded and checked here.
+        let mut issuer_uid_seen = false;
+        let mut subject_uid_seen = false;
         let mut extensions_present = false;
         while !t.is_empty() {
+            if extensions_present {
+                return Err(
+                    "trailing data after extensions field: extensions must be the last \
+                     field of tbsCertificate"
+                        .to_string(),
+                );
+            }
             let tag_hint = t.first().copied();
             let (field, rest) = read_tlv(t).map_err(|e| {
                 // A truncated field whose tag is already readable can still
-                // be located: tag 0xA3 is the extensions field.
-                if tag_hint == Some(0xA3) {
-                    format!("extensions field: {e}")
-                } else {
-                    e
+                // be located and named in the error.
+                match tag_hint {
+                    Some(0x81) => format!("issuerUniqueID: {e}"),
+                    Some(0x82) => format!("subjectUniqueID: {e}"),
+                    Some(0xA3) => format!("extensions field: {e}"),
+                    _ => e,
                 }
             })?;
-            if field.tag == 0xA3 {
-                if extensions_present {
-                    return Err("duplicate extensions field".to_string());
+            match field.tag {
+                0x81 => {
+                    if version < 1 {
+                        return Err(
+                            "issuerUniqueID is only allowed in v2 or v3 certificates, \
+                             this is a v1 certificate"
+                                .to_string(),
+                        );
+                    }
+                    if issuer_uid_seen {
+                        return Err("duplicate issuerUniqueID field".to_string());
+                    }
+                    if subject_uid_seen {
+                        return Err(
+                            "issuerUniqueID [1] must appear before subjectUniqueID [2]"
+                                .to_string(),
+                        );
+                    }
+                    issuer_uid_seen = true;
+                    // [1] IMPLICIT BIT STRING: the primitive context tag is
+                    // matched above, and the content keeps the plain BIT
+                    // STRING form (unused-bits count followed by data).
+                    check_bit_string(field.content, "issuerUniqueID")?;
                 }
-                extensions_present = true;
-                if version != 2 {
-                    let name = if version == 0 {
-                        "v1"
+                0x82 => {
+                    if version < 1 {
+                        return Err(
+                            "subjectUniqueID is only allowed in v2 or v3 certificates, \
+                             this is a v1 certificate"
+                                .to_string(),
+                        );
+                    }
+                    if subject_uid_seen {
+                        return Err("duplicate subjectUniqueID field".to_string());
+                    }
+                    subject_uid_seen = true;
+                    check_bit_string(field.content, "subjectUniqueID")?;
+                }
+                0xA1 | 0xA2 => {
+                    // Constructed context [1]/[2]: an explicit wrapper around
+                    // a BIT STRING or any other constructed form. The unique
+                    // IDs are IMPLICIT, so the primitive tags 0x81/0x82 are
+                    // the only valid encoding.
+                    let name = if field.tag == 0xA1 {
+                        "issuerUniqueID"
                     } else {
-                        "v2"
+                        "subjectUniqueID"
                     };
                     return Err(format!(
-                        "extensions are only allowed in v3 certificates, this is {name}"
+                        "{name} must use the primitive IMPLICIT BIT STRING encoding \
+                         (tag 0x{:02X}); a constructed or explicitly wrapped tag \
+                         0x{:02X} is not valid DER",
+                        field.tag - 0x20,
+                        field.tag
                     ));
                 }
-                check_extensions(field.content)?;
+                0xA3 => {
+                    extensions_present = true;
+                    if version != 2 {
+                        let name = if version == 0 {
+                            "v1"
+                        } else {
+                            "v2"
+                        };
+                        return Err(format!(
+                            "extensions are only allowed in v3 certificates, this is {name}"
+                        ));
+                    }
+                    check_extensions(field.content)?;
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected field after subjectPublicKeyInfo (tag 0x{other:02X}): \
+                         only issuerUniqueID [1], subjectUniqueID [2] and extensions [3] \
+                         are allowed there"
+                    ));
+                }
             }
             t = rest;
         }
