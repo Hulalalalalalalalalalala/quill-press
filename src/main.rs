@@ -167,7 +167,7 @@ mod x509 {
         tag: u8,
         what: &str,
     ) -> Result<(Tlv<'a>, &'a [u8]), String> {
-        let (tlv, rest) = read_tlv(buf)?;
+        let (tlv, rest) = read_tlv(buf).map_err(|e| format!("{what}: {e}"))?;
         if tlv.tag != tag {
             return Err(format!("expected {what} (tag 0x{tag:02X}), got 0x{:02X}", tlv.tag));
         }
@@ -217,7 +217,8 @@ mod x509 {
         let (issuer, t) = read_tagged(t, TAG_SEQUENCE, "issuer")?;
         let (validity, t) = read_tagged(t, TAG_SEQUENCE, "validity")?;
         let (subject, t) = read_tagged(t, TAG_SEQUENCE, "subject")?;
-        let (_spki, mut t) = read_tagged(t, TAG_SEQUENCE, "subjectPublicKeyInfo")?;
+        let (spki, mut t) = read_tagged(t, TAG_SEQUENCE, "subjectPublicKeyInfo")?;
+        check_spki(spki)?;
         // Remaining fields (issuerUniqueID, subjectUniqueID, extensions, ...)
         // are optional; they must still each be well-formed TLVs.
         while !t.is_empty() {
@@ -245,6 +246,73 @@ mod x509 {
             not_before,
             not_after,
         })
+    }
+
+    /// SubjectPublicKeyInfo ::= SEQUENCE {
+    ///   algorithm        AlgorithmIdentifier,
+    ///   subjectPublicKey BIT STRING }
+    /// Nothing may be missing and no extra elements may follow.
+    fn check_spki(spki: Tlv) -> Result<(), String> {
+        let (alg, rest) = read_tagged(
+            spki.content,
+            TAG_SEQUENCE,
+            "subjectPublicKeyInfo algorithm identifier",
+        )?;
+        check_algorithm_identifier(alg)?;
+        let (key, rest) = read_tagged(rest, TAG_BIT_STRING, "subjectPublicKey")?;
+        check_bit_string(key.content, "subjectPublicKey")?;
+        if !rest.is_empty() {
+            return Err("trailing data in subjectPublicKeyInfo".to_string());
+        }
+        Ok(())
+    }
+
+    /// AlgorithmIdentifier ::= SEQUENCE {
+    ///   algorithm  OBJECT IDENTIFIER,
+    ///   parameters ANY DEFINED BY algorithm OPTIONAL }
+    /// The parameters, if present, must be exactly one complete DER TLV;
+    /// absent parameters and an explicit NULL are both accepted. The
+    /// parameter content is not interpreted for any particular algorithm.
+    fn check_algorithm_identifier(alg: Tlv) -> Result<(), String> {
+        let (oid, rest) = read_tagged(alg.content, TAG_OID, "algorithm OID")?;
+        parse_oid(oid.content).map_err(|e| format!("algorithm OID: {e}"))?;
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let (_params, after) =
+            read_tlv(rest).map_err(|e| format!("algorithm parameters: {e}"))?;
+        if !after.is_empty() {
+            return Err("multiple algorithm parameters".to_string());
+        }
+        Ok(())
+    }
+
+    /// Validate the DER content of a BIT STRING: one leading byte counting
+    /// unused bits (0..=7), and when the count is nonzero those low bits of
+    /// the final data byte must all be zero. An empty bit string is only
+    /// legal with a zero count.
+    fn check_bit_string(content: &[u8], what: &str) -> Result<(), String> {
+        let unused = *content
+            .first()
+            .ok_or_else(|| format!("{what} BIT STRING is missing the unused-bits byte"))?;
+        if unused > 7 {
+            return Err(format!("{what} BIT STRING has invalid unused-bits count {unused}"));
+        }
+        let data = &content[1..];
+        if data.is_empty() {
+            if unused != 0 {
+                return Err(format!(
+                    "{what} BIT STRING declares {unused} unused bits but has no data"
+                ));
+            }
+            return Ok(());
+        }
+        if unused != 0 && data[data.len() - 1] & ((1u8 << unused) - 1) != 0 {
+            return Err(format!(
+                "{what} BIT STRING has set bits among the {unused} unused trailing bits"
+            ));
+        }
+        Ok(())
     }
 
     /// Render the serial number as upper-case hex, matching the integer value
