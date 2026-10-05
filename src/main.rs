@@ -217,7 +217,8 @@ mod x509 {
         let (issuer, t) = read_tagged(t, TAG_SEQUENCE, "issuer")?;
         let (validity, t) = read_tagged(t, TAG_SEQUENCE, "validity")?;
         let (subject, t) = read_tagged(t, TAG_SEQUENCE, "subject")?;
-        let (_spki, mut t) = read_tagged(t, TAG_SEQUENCE, "subjectPublicKeyInfo")?;
+        let (spki, mut t) = read_tagged(t, TAG_SEQUENCE, "subjectPublicKeyInfo")?;
+        check_subject_public_key_info(spki.content)?;
         // Remaining fields (issuerUniqueID, subjectUniqueID, extensions, ...)
         // are optional; they must still each be well-formed TLVs.
         while !t.is_empty() {
@@ -245,6 +246,97 @@ mod x509 {
             not_before,
             not_after,
         })
+    }
+
+    /// SubjectPublicKeyInfo ::= SEQUENCE {
+    ///   algorithm        AlgorithmIdentifier,
+    ///   subjectPublicKey BIT STRING }
+    ///
+    /// Only the structure is checked: the algorithm OID is not required to
+    /// be known and its parameters are not interpreted, and the key payload
+    /// is not tested against any algorithm-specific rules.
+    fn check_subject_public_key_info(content: &[u8]) -> Result<(), String> {
+        if content.is_empty() {
+            return Err("subjectPublicKeyInfo is empty".to_string());
+        }
+        let (alg, rest) =
+            read_tlv(content).map_err(|e| format!("malformed subjectPublicKeyInfo: {e}"))?;
+        if alg.tag != TAG_SEQUENCE {
+            return Err(format!(
+                "public key algorithm identifier must be a SEQUENCE (tag 0x30), got 0x{:02X}",
+                alg.tag
+            ));
+        }
+        check_algorithm_identifier(alg.content)?;
+
+        let (key, rest) =
+            read_tlv(rest).map_err(|e| format!("malformed subjectPublicKeyInfo: {e}"))?;
+        if key.tag != TAG_BIT_STRING {
+            return Err(format!(
+                "subjectPublicKey must be a BIT STRING (tag 0x03), got 0x{:02X}",
+                key.tag
+            ));
+        }
+        if !rest.is_empty() {
+            return Err("trailing data after subjectPublicKey in subjectPublicKeyInfo".to_string());
+        }
+        check_bit_string(key.content)
+            .map_err(|e| format!("invalid subjectPublicKey BIT STRING: {e}"))
+    }
+
+    /// AlgorithmIdentifier ::= SEQUENCE {
+    ///   algorithm  OBJECT IDENTIFIER,
+    ///   parameters ANY DEFINED BY algorithm OPTIONAL }
+    ///
+    /// Parameters may be absent (including an explicit NULL); at most one
+    /// complete DER value is allowed and its contents are not examined.
+    fn check_algorithm_identifier(content: &[u8]) -> Result<(), String> {
+        if content.is_empty() {
+            return Err("public key algorithm identifier is empty".to_string());
+        }
+        let (oid, rest) = read_tlv(content)
+            .map_err(|e| format!("malformed public key algorithm identifier: {e}"))?;
+        if oid.tag != TAG_OID {
+            return Err(format!(
+                "public key algorithm must be an OBJECT IDENTIFIER (tag 0x06), got 0x{:02X}",
+                oid.tag
+            ));
+        }
+        parse_oid(oid.content)
+            .map_err(|e| format!("invalid public key algorithm OID: {e}"))?;
+        if !rest.is_empty() {
+            let (_, after) = read_tlv(rest)
+                .map_err(|e| format!("malformed public key algorithm parameters: {e}"))?;
+            if !after.is_empty() {
+                return Err(
+                    "public key AlgorithmIdentifier carries more than one parameters value"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a BIT STRING payload: one unused-bits count byte followed by
+    /// the data bytes. A non-zero count requires that the corresponding low
+    /// bits of the final data byte are all zero; a count without data is
+    /// invalid.
+    fn check_bit_string(content: &[u8]) -> Result<(), String> {
+        let unused = *content
+            .first()
+            .ok_or_else(|| "missing unused-bits count byte".to_string())?;
+        if unused > 7 {
+            return Err("unused-bits count must be between 0 and 7".to_string());
+        }
+        let data = &content[1..];
+        if data.is_empty() {
+            if unused != 0 {
+                return Err("BIT STRING declares unused bits but carries no data".to_string());
+            }
+        } else if unused != 0 && data[data.len() - 1] & ((1u8 << unused) - 1) != 0 {
+            return Err("unused low bits of the last data byte must be zero".to_string());
+        }
+        Ok(())
     }
 
     /// Render the serial number as upper-case hex, matching the integer value
