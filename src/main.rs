@@ -278,8 +278,10 @@ mod x509 {
     }
 
     /// Name ::= SEQUENCE OF RDN; rendered per RFC 4514 (RDNs reversed,
-    /// multi-valued RDNs joined with '+'). Values are emitted as real UTF-8
-    /// text so non-ASCII content is preserved verbatim.
+    /// multi-valued RDNs joined with '+'). Values of known attribute types
+    /// are emitted as real UTF-8 text so non-ASCII content is preserved
+    /// verbatim; attributes without a known short name use their dotted OID
+    /// and the '#' form carrying the value's full DER encoding in hex.
     fn format_name(name: Tlv) -> Result<String, String> {
         let mut rdn_buf = name.content;
         let mut rdns: Vec<String> = Vec::new();
@@ -301,11 +303,30 @@ mod x509 {
                 }
 
                 let oid_arcs = parse_oid(oid.content)?;
-                let label = oid_short_name(&oid_arcs)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| arcs_to_string(&oid_arcs));
-                let text = decode_attribute_value(value.tag, value.content)?;
-                parts.push(format!("{label}={}", escape_value(&text)));
+                match oid_short_name(&oid_arcs) {
+                    Some(label) => {
+                        let text = decode_attribute_value(value.tag, value.content)?;
+                        parts.push(format!("{label}={}", escape_value(&text)));
+                    }
+                    None => {
+                        // Unknown attribute type: RFC 4514 requires the form
+                        // OID=#hex, where the hex is the full DER encoding
+                        // (tag, length and content) of the attribute value.
+                        // The value is still validated: a UTF8String must
+                        // hold valid UTF-8 even when shown as hex.
+                        if value.tag == 0x0C {
+                            std::str::from_utf8(value.content)
+                                .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?;
+                        }
+                        let tlv_len = after_oid.len() - after_value.len();
+                        let tlv_bytes = &after_oid[..tlv_len];
+                        let mut hex = String::with_capacity(tlv_bytes.len() * 2);
+                        for b in tlv_bytes {
+                            write!(hex, "{b:02X}").unwrap();
+                        }
+                        parts.push(format!("{}=#{hex}", arcs_to_string(&oid_arcs)));
+                    }
+                }
             }
             if parts.is_empty() {
                 return Err("empty RelativeDistinguishedName".to_string());
