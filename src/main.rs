@@ -186,7 +186,8 @@ mod x509 {
 
         let c = cert.content;
         let (tbs, c) = read_tagged(c, TAG_SEQUENCE, "tbsCertificate")?;
-        let (_sig_alg, c) = read_tagged(c, TAG_SEQUENCE, "signatureAlgorithm")?;
+        let (outer_alg, c) = read_tagged(c, TAG_SEQUENCE, "outer signatureAlgorithm")?;
+        let outer_alg = parse_signature_algorithm(outer_alg, "outer signatureAlgorithm")?;
         let (sig_value, c) = read_tlv(c)?;
         if sig_value.tag != TAG_BIT_STRING {
             return Err("signature must be a BIT STRING".to_string());
@@ -216,7 +217,11 @@ mod x509 {
 
         let (serial, t3) = read_tagged(t, TAG_INTEGER, "serialNumber")?;
         let t = t3;
-        let (_tbs_sig, t) = read_tagged(t, TAG_SEQUENCE, "tbs signatureAlgorithm")?;
+        let (tbs_alg, t) = read_tagged(t, TAG_SEQUENCE, "tbs signatureAlgorithm")?;
+        let tbs_alg = parse_signature_algorithm(tbs_alg, "tbs signatureAlgorithm")?;
+        if tbs_alg != outer_alg {
+            return Err(mismatch_message(&outer_alg, &tbs_alg));
+        }
         let (issuer, t) = read_tagged(t, TAG_SEQUENCE, "issuer")?;
         let (validity, t) = read_tagged(t, TAG_SEQUENCE, "validity")?;
         let (subject, t) = read_tagged(t, TAG_SEQUENCE, "subject")?;
@@ -454,6 +459,108 @@ mod x509 {
             return Err("multiple algorithm parameters".to_string());
         }
         Ok(())
+    }
+
+    /// One of the certificate's two signature algorithm descriptions, kept as
+    /// raw slices so two copies can be compared at the DER byte level: the OID
+    /// content (arcs in their shortest encoding) and the complete parameter
+    /// TLV (tag, length and content), or no parameter at all. An absent
+    /// parameter and an explicit NULL are different representations.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct SignatureAlgorithm<'a> {
+        oid_content: &'a [u8],
+        params: Option<&'a [u8]>,
+    }
+
+    /// Parse and fully validate one signatureAlgorithm SEQUENCE: it must start
+    /// with one complete, shortest-encoded algorithm OID, followed by either
+    /// nothing or exactly one complete DER parameter value. `loc` names which
+    /// of the two copies is being checked ("outer signatureAlgorithm" or the
+    /// copy inside tbsCertificate) and prefixes every error message.
+    fn parse_signature_algorithm<'a>(
+        alg: Tlv<'a>,
+        loc: &str,
+    ) -> Result<SignatureAlgorithm<'a>, String> {
+        let (oid, rest) = read_tlv(alg.content).map_err(|e| format!("{loc}: {e}"))?;
+        if oid.tag != TAG_OID {
+            return Err(format!(
+                "{loc}: algorithm must start with an OID (tag 0x06), got tag 0x{:02X}",
+                oid.tag
+            ));
+        }
+        // Validates the OID content itself: non-empty, complete base-128 arcs
+        // in their shortest encoding.
+        parse_oid(oid.content).map_err(|e| format!("{loc}: {e}"))?;
+        let params = if rest.is_empty() {
+            None
+        } else {
+            let (_param, after) = read_tlv(rest)
+                .map_err(|e| format!("{loc}: algorithm parameters: {e}"))?;
+            if !after.is_empty() {
+                return Err(format!(
+                    "{loc}: extra element after the algorithm parameters"
+                ));
+            }
+            // Keep the full parameter TLV (tag, length and content), sliced
+            // straight from the enclosing content; `read_tlv` already proved
+            // it is a complete value.
+            let param_len = rest.len() - after.len();
+            Some(&rest[..param_len])
+        };
+        Ok(SignatureAlgorithm {
+            oid_content: oid.content,
+            params,
+        })
+    }
+
+    /// Describe the disagreement between the outer signatureAlgorithm and the
+    /// copy inside tbsCertificate. Both copies parse on their own; they merely
+    /// fail to name the same algorithm or the same parameter representation.
+    fn mismatch_message(outer: &SignatureAlgorithm<'_>, inner: &SignatureAlgorithm<'_>) -> String {
+        const OUTER: &str = "the outer signatureAlgorithm";
+        const INNER: &str = "the signatureAlgorithm in tbsCertificate";
+        if outer.oid_content != inner.oid_content {
+            let outer_oid = parse_oid(outer.oid_content)
+                .map(|arcs| arcs_to_string(&arcs))
+                .unwrap_or_else(|_| "?".to_string());
+            let inner_oid = parse_oid(inner.oid_content)
+                .map(|arcs| arcs_to_string(&arcs))
+                .unwrap_or_else(|_| "?".to_string());
+            return format!(
+                "signature algorithm mismatch: {OUTER} names OID {outer_oid}, but {INNER} \
+                 names OID {inner_oid}"
+            );
+        }
+        match (outer.params, inner.params) {
+            (Some(outer_params), Some(inner_params)) if outer_params != inner_params => {
+                format!(
+                    "signature algorithm mismatch: both copies name the same algorithm OID but \
+                     their parameters have different DER encodings ({OUTER} has {}, {INNER} has {})",
+                    hex_of(outer_params),
+                    hex_of(inner_params),
+                )
+            }
+            (Some(_), None) => format!(
+                "signature algorithm mismatch: {OUTER} carries parameters but {INNER} omits them \
+                 (an absent parameter and an explicit value are different representations)"
+            ),
+            (None, Some(_)) => format!(
+                "signature algorithm mismatch: {INNER} carries parameters but {OUTER} omits them \
+                 (an absent parameter and an explicit value are different representations)"
+            ),
+            // PartialEq already proved the copies unequal; reaching any other
+            // arm here would be a logic error rather than a malformed cert.
+            _ => "signature algorithm mismatch between the two signatureAlgorithm copies"
+                .to_string(),
+        }
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            write!(s, "{b:02X}").unwrap();
+        }
+        s
     }
 
     /// Validate the DER content of a BIT STRING: one leading byte counting
