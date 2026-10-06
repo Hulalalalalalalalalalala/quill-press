@@ -328,8 +328,8 @@ mod x509 {
         }
 
         let serial_hex = format_serial(serial.content)?;
-        let issuer = format_name(issuer)?;
-        let subject = format_name(subject)?;
+        let issuer = format_name(issuer, "issuer")?;
+        let subject = format_name(subject, "subject")?;
 
         let v = validity.content;
         let (nb, v2) = read_tlv(v)?;
@@ -629,7 +629,14 @@ mod x509 {
     /// name and uses the '#' form carrying the value's full DER encoding in
     /// hex. Attributes without a known short name use their dotted OID with
     /// the same '#' form.
-    fn format_name(name: Tlv) -> Result<String, String> {
+    ///
+    /// Each RDN is a DER SET OF, so its complete AttributeTypeAndValue
+    /// encodings must be sorted by their full encoding bytes (tag, then
+    /// length, then content — the encoding, never the display name, dotted
+    /// OID text or decoded value). The check is per RDN; it never reorders
+    /// the members itself. `what` names the name being checked ("subject" or
+    /// "issuer") so an ordering failure identifies it in the error message.
+    fn format_name(name: Tlv, what: &str) -> Result<String, String> {
         let mut rdn_buf = name.content;
         let mut rdns: Vec<String> = Vec::new();
         while !rdn_buf.is_empty() {
@@ -638,10 +645,17 @@ mod x509 {
 
             let mut atv_buf = set.content;
             let mut parts = Vec::new();
+            // Raw full encoding (tag, length and content) of each member of
+            // this SET OF, straight from the certificate: DER SET OF ordering
+            // compares the complete member encodings byte for byte. Equal
+            // encodings may legitimately repeat and stay adjacent.
+            let mut members: Vec<&[u8]> = Vec::new();
             while !atv_buf.is_empty() {
+                let atv_start = atv_buf;
                 let (atv, rest) =
                     read_tagged(atv_buf, TAG_SEQUENCE, "AttributeTypeAndValue")?;
                 atv_buf = rest;
+                members.push(&atv_start[..atv_start.len() - atv_buf.len()]);
 
                 let (oid, after_oid) = read_tagged(atv.content, TAG_OID, "attribute OID")?;
                 let (value, after_value) = read_tlv(after_oid)?;
@@ -684,10 +698,32 @@ mod x509 {
             if parts.is_empty() {
                 return Err("empty RelativeDistinguishedName".to_string());
             }
+            check_rdn_der_order(&members, what)?;
             rdns.push(parts.join("+"));
         }
         rdns.reverse();
         Ok(rdns.join(","))
+    }
+
+    /// Validate one RDN as a DER SET OF: every member's complete
+    /// AttributeTypeAndValue encoding must be less than or equal to the next
+    /// one under ordinary byte ordering of tag, length and content. The
+    /// comparison runs on the raw encodings only — CN/O short names, dotted
+    /// OID text and decoded values never enter into it — and equal adjacent
+    /// members (duplicate attributes) are allowed. The members are never
+    /// reordered to make an unsorted input pass. `what` is "subject" or
+    /// "issuer" and identifies the offending name in the error message.
+    fn check_rdn_der_order(members: &[&[u8]], what: &str) -> Result<(), String> {
+        for pair in members.windows(2) {
+            if pair[0] > pair[1] {
+                return Err(format!(
+                    "{what} name: attributes of a multi-valued RelativeDistinguishedName \
+                     are not encoded in DER SET OF order (the members must be sorted by \
+                     their complete DER encoding bytes: tag, then length, then content)"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Uppercase hex of one complete value TLV, sliced straight from the

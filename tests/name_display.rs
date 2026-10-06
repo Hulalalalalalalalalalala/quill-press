@@ -93,18 +93,22 @@ fn mixed_known_and_unknown_attributes_keep_their_own_forms() {
     // Encoded RDN order (display is reversed):
     //   SET { C=CN }
     //   SET { O=示例公司 }
-    //   SET { CN=example.com, 1.2.3.4 "abc", 1.2.3.4 "def" }
+    //   SET { 1.2.3.4 "abc", 1.2.3.4 "def", CN=example.com }
     // The last SET is one multi-valued RDN: joined with '+', never split into
     // groups; the repeated unknown attribute appears twice (never merged); the
     // adjacent CN stays text; CJK content passes through as raw UTF-8; groups
-    // are shown in reverse order; '#' is the encoding marker, unescaped.
+    // are shown in reverse order; '#' is the encoding marker, unescaped. The
+    // members within the SET are listed in DER SET OF byte order: the two
+    // unknown attributes (shorter complete encodings than CN) sort first,
+    // then CN, and the duplicate unknown members stay adjacent in their own
+    // ascending order — display preserves that encoding order verbatim.
     let subject = name(&[
         rdn(&[atv_utf8(C, "CN")]),
         rdn(&[atv_utf8(O, "示例公司")]),
         rdn(&[
-            atv_utf8(CN, "example.com"),
             atv_utf8(&[1, 2, 3, 4], "abc"),
             atv_utf8(&[1, 2, 3, 4], "def"),
+            atv_utf8(CN, "example.com"),
         ]),
     ]);
     let issuer = simple_cn_name("Test CA");
@@ -112,7 +116,7 @@ fn mixed_known_and_unknown_attributes_keep_their_own_forms() {
 
     assert_success(
         &out,
-        "CN=example.com+1.2.3.4=#0C03616263+1.2.3.4=#0C03646566,O=示例公司,C=CN",
+        "1.2.3.4=#0C03616263+1.2.3.4=#0C03646566+CN=example.com,O=示例公司,C=CN",
         "CN=Test CA",
     );
 }
@@ -125,16 +129,20 @@ fn subject_and_issuer_render_independently() {
         rdn(&[atv_utf8(O, "测试")]),
         rdn(&[atv_utf8(CN, "subject.example")]),
     ]);
+    // The issuer's multi-valued RDN follows DER SET OF order: the unknown
+    // attribute's complete encoding is shorter, so it sorts before CN even
+    // though CN would come first as a displayed name; display keeps the
+    // encoding order.
     let issuer = name(&[rdn(&[
-        atv_utf8(CN, "Example CA"),
         atv_utf8(&[1, 2, 3, 4], "abc"),
+        atv_utf8(CN, "Example CA"),
     ])]);
     let (out, _cert) = run_inspect("separate-names", &build_cert(&subject, &issuer));
 
     assert_success(
         &out,
         "CN=subject.example,O=测试",
-        "CN=Example CA+1.2.3.4=#0C03616263",
+        "1.2.3.4=#0C03616263+CN=Example CA",
     );
 }
 
@@ -185,14 +193,18 @@ fn text_hex_and_unknown_values_mix_without_splitting_multivalued_rdn() {
     // One multi-valued RDN mixes a text value (CN), a known attribute shown as
     // hex (postalAddress SEQUENCE) and an unknown attribute shown as hex
     // (1.2.3.4). The group stays joined with '+'; a preceding text RDN and a
-    // repeated text CN in another RDN keep their order after reversal.
+    // repeated text CN in another RDN keep their order after reversal. The
+    // members are encoded in DER SET OF order, which is decided here by the
+    // outer SEQUENCE length and content bytes, not by attribute name: the
+    // shortest member (unknown 1.2.3.4) sorts first, postalAddress next and
+    // CN last — display preserves exactly that encoding order.
     let subject = name(&[
         rdn(&[atv_utf8(C, "CN")]),
         rdn(&[atv_utf8(CN, "one"), atv_utf8(CN, "two")]),
         rdn(&[
-            atv_utf8(CN, "example.com"),
-            atv(POSTAL_ADDRESS, &seq(&tlv(0x0C, b"abc"))),
             atv_utf8(&[1, 2, 3, 4], "abc"),
+            atv(POSTAL_ADDRESS, &seq(&tlv(0x0C, b"abc"))),
+            atv_utf8(CN, "example.com"),
         ]),
     ]);
     let issuer = simple_cn_name("Test CA");
@@ -201,7 +213,7 @@ fn text_hex_and_unknown_values_mix_without_splitting_multivalued_rdn() {
     assert_success(
         &out,
         &format!(
-            "CN=example.com+postalAddress=#{POSTAL_ADDRESS_ABC_HEX}+1.2.3.4=#0C03616263,\
+            "1.2.3.4=#0C03616263+postalAddress=#{POSTAL_ADDRESS_ABC_HEX}+CN=example.com,\
              CN=one+CN=two,C=CN"
         ),
         "CN=Test CA",
@@ -331,6 +343,134 @@ fn truncated_certificate_file_is_rejected() {
     let (out, _cert) = run_inspect("truncated-cert", &bytes);
 
     assert_invalid_certificate(&out);
+}
+
+// ----- DER SET OF ordering inside multi-valued RDNs ------------------------
+
+#[test]
+fn unsorted_subject_multivalued_rdn_is_rejected() {
+    // O and CN in one RDN, encoded O-first: both members have the same outer
+    // tag and length, and O's OID arc byte 0x0A is greater than CN's 0x03, so
+    // the SET OF is not byte-sorted. This must fail as a corrupt certificate
+    // and name the subject, never be printed or repaired by reordering the
+    // members (alphabetically "CN" would sort first, which is exactly the
+    // kind of display-name comparison that must not be used).
+    let subject = name(&[rdn(&[atv_utf8(O, "y"), atv_utf8(CN, "x")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bad-order-subject", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("subject") && stderr.contains("order"),
+        "reason must name the subject name and the ordering problem: {stderr}"
+    );
+}
+
+#[test]
+fn unsorted_issuer_multivalued_rdn_is_rejected() {
+    // Same violation in the issuer must be reported against the issuer name,
+    // even though the subject is well-formed.
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv_utf8(O, "y"), atv_utf8(CN, "x")])]);
+    let (out, _cert) = run_inspect("bad-order-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("order"),
+        "reason must name the issuer name and the ordering problem: {stderr}"
+    );
+}
+
+#[test]
+fn ordering_compares_encoding_content_not_attribute_text() {
+    // The same unknown OID twice (identical dotted text) with values "b" and
+    // "a": both complete encodings have equal tag and length, and the first
+    // value byte 0x62 > 0x61, so "b" before "a" is out of DER order. Sorting
+    // by attribute name or value text would call these identical or sort the
+    // same way only by accident; this pins the comparison to encoding bytes.
+    let subject = name(&[rdn(&[
+        atv_utf8(&[1, 2, 3, 4], "b"),
+        atv_utf8(&[1, 2, 3, 4], "a"),
+    ])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bad-order-content", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+}
+
+#[test]
+fn ordering_compares_outer_length_before_value_text() {
+    // CN="z" (complete ATV encoding 10 bytes) and 1.2.3.4="aaa" (12 bytes,
+    // because its value is longer): DER compares tag, then the outer length
+    // byte, so the shorter CN member sorts first even though the decoded
+    // value text "aaa" would come well before "z". A comparison based on
+    // decoded values would reject this legal certificate.
+    let subject = name(&[rdn(&[
+        atv_utf8(CN, "z"),
+        atv_utf8(&[1, 2, 3, 4], "aaa"),
+    ])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("order-by-length", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=z+1.2.3.4=#0C03616161", "CN=Test CA");
+
+    // The reverse encoding is corrupt: the longer outer encoding must not
+    // come first, regardless of the '#' text representation.
+    let subject = name(&[rdn(&[
+        atv_utf8(&[1, 2, 3, 4], "aaa"),
+        atv_utf8(CN, "z"),
+    ])]);
+    let (out, _cert) = run_inspect("order-by-length-bad", &build_cert(&subject, &issuer));
+    assert_invalid_certificate(&out);
+}
+
+#[test]
+fn each_rdn_is_checked_independently() {
+    // Two RDNs in one name: the first (outermost) group is fine, a later
+    // group carries O-before-CN out of order (OID arc 0x0A > 0x03). The
+    // whole name must be rejected rather than treated as one set or checked
+    // only on a group of the checker's choosing.
+    let subject = name(&[
+        rdn(&[atv_utf8(C, "CN")]),
+        rdn(&[atv_utf8(O, "y"), atv_utf8(CN, "x")]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bad-order-second-rdn", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("subject"));
+}
+
+#[test]
+fn identical_adjacent_members_are_allowed_and_not_deduplicated() {
+    // Two members with byte-for-byte identical complete encodings compare
+    // equal and therefore satisfy the sorted SET OF rule; both must still
+    // appear in the output (no merging, no false ordering failure).
+    let subject = name(&[rdn(&[
+        atv_utf8(CN, "dup"),
+        atv_utf8(CN, "dup"),
+    ])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("dup-members", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=dup+CN=dup", "CN=Test CA");
+}
+
+#[test]
+fn single_attribute_rdn_always_satisfies_set_ordering() {
+    // A SET OF with one member is trivially sorted, whatever the attribute
+    // and value encodings are.
+    let subject = name(&[
+        rdn(&[atv_utf8(C, "CN")]),
+        rdn(&[atv_utf8(O, "org")]),
+        rdn(&[atv_utf8(CN, "host")]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("single-member-rdns", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=host,O=org,C=CN", "CN=Test CA");
 }
 
 // ----- CLI contract: usage, version and unreadable files ------------------
