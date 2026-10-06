@@ -415,6 +415,177 @@ fn non_ascii_and_at_still_display_in_utf8_string() {
     assert_success(&out, "CN=user@示例.test", "CN=Test CA");
 }
 
+// ----- BMPString (tag 0x1E) encoding rules ---------------------------------
+
+#[test]
+fn legal_bmp_string_displays_as_text_with_cjk_preserved() {
+    // "示例" as BMP code units U+793A U+4F8B: each BMP character is one
+    // big-endian 16-bit unit, decoded straight to UTF-8 text and shown raw.
+    let subject = name(&[rdn(&[atv_bmp(CN, &[0x793A, 0x4F8B])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-legal-cjk", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=示例", "CN=Test CA");
+}
+
+#[test]
+fn legal_bmp_string_keeps_rfc4514_escaping() {
+    // The decoded text goes through the same escaping as every other text
+    // value: ',' is escaped anywhere and a leading space is escaped.
+    let subject = name(&[rdn(&[atv_bmp(CN, &[0x0041, 0x002C, 0x0042, 0x0020])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-legal-escape", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=A\\,B\\ ", "CN=Test CA");
+}
+
+#[test]
+fn empty_bmp_string_is_accepted() {
+    // Empty content keeps the pre-existing acceptance.
+    let subject = name(&[rdn(&[atv_bmp(CN, &[])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-empty", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=", "CN=Test CA");
+}
+
+#[test]
+fn legal_bmp_string_for_unknown_oid_uses_full_der_hex() {
+    // A valid BMPString at an unknown OID is still shown by encoding, never
+    // decoded to text: tag 0x1E, length and content in uppercase hex.
+    let subject = name(&[rdn(&[atv_bmp(&[1, 2, 3, 4], &[0x793A, 0x4F8B])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-unknown", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "1.2.3.4=#1E04793A4F8B", "CN=Test CA");
+}
+
+#[test]
+fn odd_length_bmp_string_in_subject_is_rejected() {
+    // Three bytes cannot encode whole 16-bit characters; the certificate is
+    // corrupt even though the bytes otherwise sit inside a valid TLV.
+    let value = tlv(0x1E, &[0x00, 0x41, 0x00]);
+    let subject = name(&[rdn(&[atv(CN, &value)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-odd-subject", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("subject") && stderr.contains("BMPString"),
+        "reason must name the subject name and BMPString: {stderr}"
+    );
+    assert!(
+        stderr.contains("odd") || stderr.contains("length"),
+        "reason must explain the length problem: {stderr}"
+    );
+}
+
+#[test]
+fn odd_length_bmp_string_in_issuer_is_rejected_and_named() {
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv(CN, &tlv(0x1E, &[0x00, 0x41, 0xFF]))])]);
+    let (out, _cert) = run_inspect("bmp-odd-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("BMPString"),
+        "reason must name the issuer name and BMPString: {stderr}"
+    );
+    assert!(
+        stderr.contains("odd") || stderr.contains("length"),
+        "reason must explain the length problem: {stderr}"
+    );
+}
+
+#[test]
+fn lone_surrogates_in_bmp_string_are_rejected() {
+    // A lone high surrogate and a lone low surrogate are each illegal
+    // BMPString characters, in a known attribute and surrounded by legal
+    // units. They must never be printed, dropped or replaced.
+    for bad in [
+        vec![0x0041, 0xD800, 0x0042],
+        vec![0x0041, 0xDC00, 0x0042],
+        vec![0xDBFF],
+        vec![0xDFFF],
+    ] {
+        let subject = name(&[rdn(&[atv_bmp(CN, &bad)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("bmp-lone-surrogate", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        let stderr = lossy(&out.stderr);
+        assert!(
+            stderr.contains("subject") && stderr.contains("BMPString"),
+            "units {bad:04X?} must fail as a subject BMPString error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn adjacent_surrogate_pair_in_bmp_string_is_rejected_not_combined() {
+    // D83D DE00 is a well-formed UTF-16 pair for U+1F600, but BMPString is
+    // not UTF-16: the units must stay independent characters, and either
+    // surrogate on its own is illegal. The pair must not be combined into
+    // the plane-1 character and displayed.
+    let subject = name(&[rdn(&[atv_bmp(CN, &[0xD83D, 0xDE00])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-pair-known", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(stderr.contains("BMPString"), "reason must name BMPString: {stderr}");
+    assert!(!lossy(&out.stdout).contains('\u{1F600}'));
+}
+
+#[test]
+fn surrogate_pair_in_bmp_string_at_unknown_oid_cannot_be_accepted_via_hex() {
+    // The hex display form for unknown attributes is not an escape hatch:
+    // surrogate units are invalid regardless of how the value is rendered.
+    let subject = name(&[rdn(&[atv_bmp(&[1, 2, 3, 4], &[0xD800, 0xDC00])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-pair-unknown", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("BMPString") && stderr.contains("subject"),
+        "reason must name the subject BMPString: {stderr}"
+    );
+}
+
+#[test]
+fn surrogate_in_issuer_bmp_string_is_rejected_and_named() {
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv_bmp(CN, &[0x0041, 0xD800])])]);
+    let (out, _cert) = run_inspect("bmp-surrogate-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("BMPString"),
+        "reason must name the issuer name and BMPString: {stderr}"
+    );
+}
+
+#[test]
+fn plane1_characters_remain_viewable_in_other_string_types() {
+    // The new rule is specific to BMPString: U+1F600 is still a perfectly
+    // legal character when carried by UniversalString (tag 0x1C, big-endian
+    // 32-bit code points) or UTF8String (tag 0x0C); both keep displaying as
+    // text. The BMPString form of the same character (a surrogate pair) is
+    // rejected in a separate test.
+    let subject = name(&[
+        rdn(&[atv(CN, &tlv(0x1C, &[0x00, 0x01, 0xF6, 0x00]))]),
+        rdn(&[atv_utf8(O, "happy 😀 day")]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-other-types", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "O=happy 😀 day,CN=😀", "CN=Test CA");
+}
+
 #[test]
 fn truncated_attribute_value_is_rejected() {
     // The value header announces five content bytes but only three follow;
@@ -777,6 +948,16 @@ fn atv_utf8(arcs: &[u64], text: &str) -> Vec<u8> {
 
 fn atv_printable(arcs: &[u64], bytes: &[u8]) -> Vec<u8> {
     atv(arcs, &tlv(0x13, bytes))
+}
+
+/// Attribute whose value is a BMPString (tag 0x1E); each unit is one
+/// big-endian 16-bit character as encoded on the wire.
+fn atv_bmp(arcs: &[u64], units: &[u16]) -> Vec<u8> {
+    let mut content = Vec::with_capacity(units.len() * 2);
+    for u in units {
+        content.extend_from_slice(&u.to_be_bytes());
+    }
+    atv(arcs, &tlv(0x1E, &content))
 }
 
 fn oid(arcs: &[u64]) -> Vec<u8> {

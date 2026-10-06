@@ -115,6 +115,7 @@ mod x509 {
     const TAG_UTC_TIME: u8 = 0x17;
     const TAG_GENERALIZED_TIME: u8 = 0x18;
     const TAG_PRINTABLE_STRING: u8 = 0x13;
+    const TAG_BMP_STRING: u8 = 0x1E;
 
     /// Read exactly one DER TLV. Rejects indefinite length, non-minimal
     /// length encodings and truncated data.
@@ -668,11 +669,14 @@ mod x509 {
 
                 // The value's own type rules apply before any display decision:
                 // a PrintableString must hold only the RFC 5280 PrintableString
-                // alphabet, whether the attribute later renders as text for a
-                // known short name or as '#'-hex for an unknown type. The hex
-                // form must never let an illegal byte through, and an illegal
-                // byte cannot be dropped or replaced. An empty value stays
-                // legal. `what` names the offending name ("subject"/"issuer").
+                // alphabet, and a BMPString must hold an even number of bytes
+                // encoding 16-bit characters outside the surrogate range —
+                // whether the attribute later renders as text for a known
+                // short name or as '#'-hex for an unknown type. The hex form
+                // must never let an illegal byte or code unit through, and an
+                // illegal unit cannot be dropped, replaced or pair-combined.
+                // An empty value stays legal. `what` names the offending name
+                // ("subject"/"issuer").
                 if value.tag == TAG_PRINTABLE_STRING
                     && !is_printable_string(value.content)
                 {
@@ -681,6 +685,11 @@ mod x509 {
                          character (only A-Z, a-z, 0-9, space and ' ( ) + , - . / : = ? are \
                          allowed)"
                     ));
+                }
+                if value.tag == TAG_BMP_STRING {
+                    if let Err(reason) = check_bmp_string(value.content) {
+                        return Err(format!("{what} name: {reason}"));
+                    }
                 }
 
                 match oid_short_name(&oid_arcs) {
@@ -704,9 +713,11 @@ mod x509 {
                         // OID=#hex, where the hex is the full DER encoding
                         // (tag, length and content) of the attribute value.
                         // Showing the value as hex does not bypass its type
-                        // rules: UTF8String content must be valid UTF-8 and a
-                        // PrintableString must keep to its alphabet, checks
-                        // already performed above before this match.
+                        // rules: UTF8String content must be valid UTF-8, a
+                        // PrintableString must keep to its alphabet and a
+                        // BMPString must be an even number of non-surrogate
+                        // 16-bit units; those checks are performed above
+                        // before this match.
                         if value.tag == 0x0C {
                             std::str::from_utf8(value.content)
                                 .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?;
@@ -886,6 +897,36 @@ mod x509 {
         ))
     }
 
+    /// Validate the content of a BMPString (tag 0x1E): a sequence of 16-bit
+    /// characters in big-endian order, so the byte count must be even and
+    /// every code unit must name a scalar in the BMP (U+0000..=U+FFFF) that
+    /// is not a UTF-16 surrogate (U+D800..=U+DFFF). A lone high or low
+    /// surrogate is illegal, and so is a pair of adjacent surrogates that
+    /// would otherwise combine into a character outside the BMP: BMPString
+    /// is not UTF-16 and never performs surrogate pairing. An empty value
+    /// passes, preserving the existing acceptance of empty contents.
+    fn check_bmp_string(content: &[u8]) -> Result<(), String> {
+        if content.len() % 2 != 0 {
+            return Err(
+                "BMPString attribute value has an odd byte length (the content must encode a \
+                 whole number of big-endian 16-bit characters)"
+                    .to_string(),
+            );
+        }
+        for c in content.chunks_exact(2) {
+            let unit = u16::from_be_bytes([c[0], c[1]]);
+            if (0xD800..=0xDFFF).contains(&unit) {
+                return Err(
+                    "BMPString attribute value contains an illegal UTF-16 surrogate code unit \
+                     (U+D800-U+DFFF are not BMPString characters; lone surrogates and adjacent \
+                     surrogate pairs are not combined)"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Decode a DirectoryString-style attribute value into UTF-8 text.
     fn decode_attribute_value(tag: u8, content: &[u8]) -> Result<String, String> {
         let s = match tag {
@@ -900,13 +941,19 @@ mod x509 {
                 if content.len() % 2 != 0 {
                     return Err("odd-length BMPString".to_string());
                 }
-                let units: Vec<u16> = content
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .collect();
-                char::decode_utf16(units.iter().copied())
-                    .map(|r| r.map_err(|_| "unpaired surrogate in BMPString".to_string()))
-                    .collect::<Result<String, _>>()?
+                let mut s = String::with_capacity(content.len() / 2);
+                for c in content.chunks_exact(2) {
+                    // Each big-endian 16-bit unit is one BMP character. Units
+                    // in U+D800..=U+DFFF are surrogates, not characters: they
+                    // are rejected rather than paired with a neighbour, since
+                    // BMPString is not UTF-16. `format_name` validates this
+                    // before display; the conversion applies the same rule.
+                    let unit = u16::from_be_bytes([c[0], c[1]]);
+                    let ch = char::from_u32(unit as u32)
+                        .ok_or_else(|| "illegal character in BMPString".to_string())?;
+                    s.push(ch);
+                }
+                s
             }
             0x1C => {
                 if content.len() % 4 != 0 {
