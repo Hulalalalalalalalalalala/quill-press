@@ -443,65 +443,61 @@ mod x509 {
         Ok(())
     }
 
-    /// AlgorithmIdentifier ::= SEQUENCE {
-    ///   algorithm  OBJECT IDENTIFIER,
-    ///   parameters ANY DEFINED BY algorithm OPTIONAL }
-    /// The parameters, if present, must be exactly one complete DER TLV;
-    /// absent parameters and an explicit NULL are both accepted. The
-    /// parameter content is not interpreted for any particular algorithm.
-    fn check_algorithm_identifier(alg: Tlv) -> Result<(), String> {
-        let (oid, rest) = read_tagged(alg.content, TAG_OID, "algorithm OID")?;
-        parse_oid(oid.content).map_err(|e| format!("algorithm OID: {e}"))?;
-        if rest.is_empty() {
-            return Ok(());
-        }
-        let (_params, after) =
-            read_tlv(rest).map_err(|e| format!("algorithm parameters: {e}"))?;
-        if !after.is_empty() {
-            return Err("multiple algorithm parameters".to_string());
-        }
-        Ok(())
-    }
-
-    /// One of the certificate's two signature algorithm descriptions, kept as
-    /// raw slices so two copies can be compared at the DER byte level: the OID
-    /// content (arcs in their shortest encoding) and the complete parameter
-    /// TLV (tag, length and content), or no parameter at all. An absent
-    /// parameter and an explicit NULL are different representations.
+    /// An AlgorithmIdentifier kept as raw slices: the OID content (arcs in
+    /// their shortest encoding) and the complete parameter TLV (tag, length
+    /// and content), or no parameter at all. An absent parameter and an
+    /// explicit NULL are different representations. Keeping the raw bytes
+    /// lets two signature algorithm copies be compared at the DER byte level.
     #[derive(Clone, Copy, PartialEq, Eq)]
-    struct SignatureAlgorithm<'a> {
+    struct AlgorithmIdentifier<'a> {
         oid_content: &'a [u8],
         params: Option<&'a [u8]>,
     }
 
-    /// Parse and fully validate one signatureAlgorithm SEQUENCE: it must start
-    /// with one complete, shortest-encoded algorithm OID, followed by either
-    /// nothing or exactly one complete DER parameter value. `loc` names which
-    /// of the two copies is being checked ("outer signatureAlgorithm" or the
-    /// copy inside tbsCertificate) and prefixes every error message.
-    fn parse_signature_algorithm<'a>(
-        alg: Tlv<'a>,
-        loc: &str,
-    ) -> Result<SignatureAlgorithm<'a>, String> {
-        let (oid, rest) = read_tlv(alg.content).map_err(|e| format!("{loc}: {e}"))?;
+    /// Which structural rule of an AlgorithmIdentifier a malformed input
+    /// violated. The reading positions (subjectPublicKeyInfo, the two
+    /// signatureAlgorithm copies) word these failures differently, so the
+    /// shared parser reports the violation and each caller phrases it.
+    enum AlgIdError {
+        /// The OID element itself could not be read as one complete TLV.
+        ReadOid(String),
+        /// The first element exists but is not an OBJECT IDENTIFIER.
+        OidTag(u8),
+        /// The OID content is not valid shortest-form base-128 arcs.
+        BadOid(String),
+        /// The parameter element could not be read as one complete TLV.
+        ReadParams(String),
+        /// A further element follows the parameter value.
+        TrailingAfterParams,
+    }
+
+    /// Parse and fully validate one AlgorithmIdentifier SEQUENCE:
+    ///
+    /// ```text
+    /// AlgorithmIdentifier ::= SEQUENCE {
+    ///   algorithm  OBJECT IDENTIFIER,
+    ///   parameters ANY DEFINED BY algorithm OPTIONAL }
+    /// ```
+    ///
+    /// It must start with one complete, shortest-encoded algorithm OID,
+    /// followed by either nothing or exactly one complete DER parameter
+    /// value. Absent parameters and an explicit NULL are both accepted, and
+    /// the parameter content is not interpreted for any particular algorithm;
+    /// unknown but well-formed OIDs are accepted as well.
+    fn parse_algorithm_identifier<'a>(alg: Tlv<'a>) -> Result<AlgorithmIdentifier<'a>, AlgIdError> {
+        let (oid, rest) = read_tlv(alg.content).map_err(AlgIdError::ReadOid)?;
         if oid.tag != TAG_OID {
-            return Err(format!(
-                "{loc}: algorithm must start with an OID (tag 0x06), got tag 0x{:02X}",
-                oid.tag
-            ));
+            return Err(AlgIdError::OidTag(oid.tag));
         }
         // Validates the OID content itself: non-empty, complete base-128 arcs
         // in their shortest encoding.
-        parse_oid(oid.content).map_err(|e| format!("{loc}: {e}"))?;
+        parse_oid(oid.content).map_err(AlgIdError::BadOid)?;
         let params = if rest.is_empty() {
             None
         } else {
-            let (_param, after) = read_tlv(rest)
-                .map_err(|e| format!("{loc}: algorithm parameters: {e}"))?;
+            let (_param, after) = read_tlv(rest).map_err(AlgIdError::ReadParams)?;
             if !after.is_empty() {
-                return Err(format!(
-                    "{loc}: extra element after the algorithm parameters"
-                ));
+                return Err(AlgIdError::TrailingAfterParams);
             }
             // Keep the full parameter TLV (tag, length and content), sliced
             // straight from the enclosing content; `read_tlv` already proved
@@ -509,16 +505,57 @@ mod x509 {
             let param_len = rest.len() - after.len();
             Some(&rest[..param_len])
         };
-        Ok(SignatureAlgorithm {
+        Ok(AlgorithmIdentifier {
             oid_content: oid.content,
             params,
+        })
+    }
+
+    /// Validate the AlgorithmIdentifier inside subjectPublicKeyInfo, wording
+    /// every failure the way public-key information errors have always been
+    /// worded. The parsed pieces are not kept: nothing compares this
+    /// identifier against the signature algorithms.
+    fn check_algorithm_identifier(alg: Tlv) -> Result<(), String> {
+        parse_algorithm_identifier(alg)
+            .map_err(|e| match e {
+                AlgIdError::ReadOid(e) => format!("algorithm OID: {e}"),
+                AlgIdError::OidTag(tag) => {
+                    format!("expected algorithm OID (tag 0x06), got 0x{tag:02X}")
+                }
+                AlgIdError::BadOid(e) => format!("algorithm OID: {e}"),
+                AlgIdError::ReadParams(e) => format!("algorithm parameters: {e}"),
+                AlgIdError::TrailingAfterParams => {
+                    "multiple algorithm parameters".to_string()
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Validate one signatureAlgorithm SEQUENCE and keep its raw pieces for
+    /// the byte-level comparison of the certificate's two copies. `loc` names
+    /// which of the two copies is being checked ("outer signatureAlgorithm"
+    /// or the copy inside tbsCertificate) and prefixes every error message.
+    fn parse_signature_algorithm<'a>(
+        alg: Tlv<'a>,
+        loc: &str,
+    ) -> Result<AlgorithmIdentifier<'a>, String> {
+        parse_algorithm_identifier(alg).map_err(|e| match e {
+            AlgIdError::ReadOid(e) => format!("{loc}: {e}"),
+            AlgIdError::OidTag(tag) => format!(
+                "{loc}: algorithm must start with an OID (tag 0x06), got tag 0x{tag:02X}"
+            ),
+            AlgIdError::BadOid(e) => format!("{loc}: {e}"),
+            AlgIdError::ReadParams(e) => format!("{loc}: algorithm parameters: {e}"),
+            AlgIdError::TrailingAfterParams => {
+                format!("{loc}: extra element after the algorithm parameters")
+            }
         })
     }
 
     /// Describe the disagreement between the outer signatureAlgorithm and the
     /// copy inside tbsCertificate. Both copies parse on their own; they merely
     /// fail to name the same algorithm or the same parameter representation.
-    fn mismatch_message(outer: &SignatureAlgorithm<'_>, inner: &SignatureAlgorithm<'_>) -> String {
+    fn mismatch_message(outer: &AlgorithmIdentifier<'_>, inner: &AlgorithmIdentifier<'_>) -> String {
         const OUTER: &str = "the outer signatureAlgorithm";
         const INNER: &str = "the signatureAlgorithm in tbsCertificate";
         if outer.oid_content != inner.oid_content {
