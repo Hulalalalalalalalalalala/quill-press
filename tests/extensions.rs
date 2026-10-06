@@ -18,6 +18,10 @@
 //!   nonzero bytes, empty content and multi-byte contents are all rejected;
 //! - unknown but legal extension OIDs, critical TRUE and empty OCTET STRING
 //!   values are all accepted; extension bytes are never interpreted.
+//! - every extension OID may appear at most once in the list: identity is the
+//!   complete OID alone, so identical entries or the same OID with different
+//!   values/critical flags, adjacent or separated, are all rejected with the
+//!   full dotted OID named; distinct OIDs with identical bodies still coexist.
 //!
 //! Every case drives the real binary: success prints exactly the five fixed
 //! fields (no extension summary is added); failure is exit code 2, completely
@@ -381,6 +385,89 @@ fn extension_critical_with_multiple_content_bytes_is_rejected() {
     assert_invalid_certificate(&run_inspect("crit-multi", &cert));
 }
 
+// ----- Failure: duplicate extension types -----------------------------------
+
+#[test]
+fn adjacent_identical_extension_oid_is_rejected() {
+    // The same private OID twice in a row, even with identical encodings, is
+    // a corrupt certificate; the duplicate must not simply be dropped or one
+    // entry picked.
+    let ext = extension(UNKNOWN_OID, None, &[0x00]);
+    let items = concat(&[&ext, &ext]);
+    let cert = build_cert(Some(2), &extensions_field(&items));
+    assert_duplicate_oid(&run_inspect("dup-oid-adjacent", &cert), "1.2.3.4");
+}
+
+#[test]
+fn same_extension_oid_with_different_values_and_critical_is_rejected() {
+    // Duplicate identity is the OID alone: a different extnValue and critical
+    // flag must not make the second entry a distinct extension.
+    let first = extension(UNKNOWN_OID, Some(true), b"one");
+    let second = extension(UNKNOWN_OID, None, b"completely different");
+    let items = concat(&[&first, &second]);
+    let cert = build_cert(Some(2), &extensions_field(&items));
+    assert_duplicate_oid(&run_inspect("dup-oid-diff-body", &cert), "1.2.3.4");
+}
+
+#[test]
+fn duplicate_extension_oid_separated_by_other_extensions_is_rejected() {
+    // The two 1.2.3.4 entries bracket legal, distinct extensions; neither
+    // adjacency nor merging is involved.
+    let a = extension(UNKNOWN_OID, None, b"a");
+    let ski = extension(&[2, 5, 29, 14], None, &[0x04, 0x02, 0xAA, 0xBB]);
+    let other = extension(&[1, 2, 840, 99999, 7], Some(true), &[0x01]);
+    let dup = extension(UNKNOWN_OID, Some(true), b"b");
+    let items = concat(&[&a, &ski, &other, &dup]);
+    let cert = build_cert(Some(2), &extensions_field(&items));
+    assert_duplicate_oid(&run_inspect("dup-oid-split", &cert), "1.2.3.4");
+}
+
+#[test]
+fn duplicate_oid_with_multibyte_arcs_is_rejected_with_full_dotted_form() {
+    // Unknown private OID whose arcs use multi-byte base-128 encodings: the
+    // error must render every arc of the full dotted-decimal OID.
+    let long_oid: &[u64] = &[1, 2, 840, 113549, 1, 999999999999];
+    let first = extension(long_oid, None, &[0x01]);
+    let second = extension(long_oid, Some(true), &[0x02, 0x03]);
+    let items = concat(&[&first, &second]);
+    let cert = build_cert(Some(2), &extensions_field(&items));
+    assert_duplicate_oid(
+        &run_inspect("dup-oid-multibyte", &cert),
+        "1.2.840.113549.1.999999999999",
+    );
+}
+
+#[test]
+fn duplicate_known_extension_oid_is_rejected() {
+    // The rule applies to recognized extension types too.
+    let first = extension(&[2, 5, 29, 14], None, &[0x04, 0x00]);
+    let second = extension(&[2, 5, 29, 14], None, &[0x04, 0x02, 0xAA, 0xBB]);
+    let items = concat(&[&first, &second]);
+    let cert = build_cert(Some(2), &extensions_field(&items));
+    assert_duplicate_oid(&run_inspect("dup-oid-ski", &cert), "2.5.29.14");
+}
+
+// ----- Success: distinct extension types ------------------------------------
+
+#[test]
+fn different_extension_oids_with_identical_body_and_critical_are_accepted() {
+    // Same value and critical flag never make two distinct OIDs a duplicate.
+    let a = extension(&[1, 2, 3, 4], Some(true), b"same");
+    let b = extension(&[1, 2, 3, 5], Some(true), b"same");
+    let c = extension(&[2, 5, 29, 14], Some(true), b"same");
+    let items = concat(&[&a, &b, &c]);
+    let cert = build_cert(Some(2), &extensions_field(&items));
+    assert_success(&run_inspect("distinct-oid-same-body", &cert));
+}
+
+#[test]
+fn no_extensions_and_single_extension_remain_accepted() {
+    // Zero extensions (no field at all) and one extension never collide.
+    assert_success(&run_inspect("no-ext-field", &build_cert(Some(2), &[])));
+    let ext = extension(UNKNOWN_OID, None, &[]);
+    assert_success(&run_inspect("one-ext-field", &build_cert(Some(2), &extensions_field(&ext))));
+}
+
 // ----- Failure: extension OID encoding --------------------------------------
 
 #[test]
@@ -463,6 +550,23 @@ fn assert_invalid_certificate(out: &Output) {
     assert!(
         reason.to_ascii_lowercase().contains("extension"),
         "error reason must locate the failure in the extensions field: {reason}"
+    );
+}
+
+/// Duplicate-extension-type failure: exit 2, empty stdout, and the reason
+/// must say the extension type is duplicated and name the complete dotted
+/// OID so the conflicting entries can be located.
+fn assert_duplicate_oid(out: &Output, dotted_oid: &str) {
+    assert_invalid_certificate(out);
+    let stderr = lossy(&out.stderr);
+    let reason = stderr.trim_end();
+    assert!(
+        reason.to_ascii_lowercase().contains("duplicate extension type"),
+        "reason must identify a duplicate extension type: {reason}"
+    );
+    assert!(
+        reason.contains(dotted_oid),
+        "reason must give the full dotted OID {dotted_oid}: {reason}"
     );
 }
 

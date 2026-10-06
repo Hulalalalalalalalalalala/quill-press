@@ -368,6 +368,12 @@ mod x509 {
     /// with at most one (DER-encoded) BOOLEAN between them and nothing after.
     /// Extension contents are never interpreted: unknown but well-formed
     /// extension OIDs are accepted and `critical: TRUE` is not a failure.
+    ///
+    /// Each extension type (its complete OID) may occur at most once in the
+    /// list. Identity is the OID alone — critical flag, value content and
+    /// value length never distinguish two entries — so a duplicate is neither
+    /// picked between, merged nor dropped: the whole certificate is rejected,
+    /// whether the duplicates are adjacent or separated by other extensions.
     fn check_extensions(wrapper: &[u8]) -> Result<(), String> {
         let (list, rest) = read_tagged(wrapper, TAG_SEQUENCE, "extensions")?;
         if !rest.is_empty() {
@@ -377,13 +383,28 @@ mod x509 {
             return Err("extensions SEQUENCE is empty".to_string());
         }
 
+        // Complete OIDs (parsed arcs) already seen in this list. DER mandates
+        // one shortest encoding per OID and `parse_oid` enforces it, so equal
+        // arcs mean the same OID regardless of raw bytes; the list is short,
+        // a linear scan keeps the representation simple.
+        let mut seen_oids: Vec<Vec<u64>> = Vec::new();
         let mut buf = list.content;
         while !buf.is_empty() {
             let (ext, rest) = read_tagged(buf, TAG_SEQUENCE, "extension")?;
             buf = rest;
 
             let (oid, after_oid) = read_tagged(ext.content, TAG_OID, "extension OID")?;
-            parse_oid(oid.content).map_err(|e| format!("extension OID: {e}"))?;
+            let oid_arcs =
+                parse_oid(oid.content).map_err(|e| format!("extension OID: {e}"))?;
+            if seen_oids.contains(&oid_arcs) {
+                return Err(format!(
+                    "duplicate extension type OID {}: an extension OID may appear at most once \
+                     in the extensions list, regardless of its critical flag or extension value \
+                     (duplicate entries are not selected between, merged or removed)",
+                    arcs_to_string(&oid_arcs)
+                ));
+            }
+            seen_oids.push(oid_arcs);
 
             // critical is optional; whatever stands between the OID and the
             // OCTET STRING must be exactly one BOOLEAN if it is present.
