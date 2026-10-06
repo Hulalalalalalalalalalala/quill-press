@@ -368,6 +368,16 @@ mod x509 {
     /// with at most one (DER-encoded) BOOLEAN between them and nothing after.
     /// Extension contents are never interpreted: unknown but well-formed
     /// extension OIDs are accepted and `critical: TRUE` is not a failure.
+    ///
+    /// RFC 5280 requires every extnID in the list to be distinct: the same OID
+    /// may appear only once, no matter whether the two occurrences carry the
+    /// same value, different values or different critical flags, and no matter
+    /// whether they are adjacent. Identity is the decoded OID value alone
+    /// (`parse_oid` already enforced the shortest encoding, so every
+    /// decodable OID compares correctly, including private arcs and
+    /// multi-byte base-128 arcs). A duplicate rejects the whole certificate;
+    /// no occurrence is picked, merged or dropped, and the error names the
+    /// full dotted-decimal OID so the conflict can be located.
     fn check_extensions(wrapper: &[u8]) -> Result<(), String> {
         let (list, rest) = read_tagged(wrapper, TAG_SEQUENCE, "extensions")?;
         if !rest.is_empty() {
@@ -377,13 +387,25 @@ mod x509 {
             return Err("extensions SEQUENCE is empty".to_string());
         }
 
+        // Decoded arc lists of the extension OIDs already seen in this list;
+        // each value may occur at most once.
+        let mut seen_oids: Vec<Vec<u64>> = Vec::new();
         let mut buf = list.content;
         while !buf.is_empty() {
             let (ext, rest) = read_tagged(buf, TAG_SEQUENCE, "extension")?;
             buf = rest;
 
             let (oid, after_oid) = read_tagged(ext.content, TAG_OID, "extension OID")?;
-            parse_oid(oid.content).map_err(|e| format!("extension OID: {e}"))?;
+            let oid_arcs =
+                parse_oid(oid.content).map_err(|e| format!("extension OID: {e}"))?;
+            if seen_oids.iter().any(|seen| seen == &oid_arcs) {
+                return Err(format!(
+                    "duplicate extension type {}: an OID may appear at most once in the \
+                     extensions list, regardless of the critical flag or extension value",
+                    arcs_to_string(&oid_arcs)
+                ));
+            }
+            seen_oids.push(oid_arcs);
 
             // critical is optional; whatever stands between the OID and the
             // OCTET STRING must be exactly one BOOLEAN if it is present.

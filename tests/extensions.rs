@@ -18,6 +18,10 @@
 //!   nonzero bytes, empty content and multi-byte contents are all rejected;
 //! - unknown but legal extension OIDs, critical TRUE and empty OCTET STRING
 //!   values are all accepted; extension bytes are never interpreted.
+//! - every extnID in one Extensions list must be distinct: two extensions with
+//!   the same full OID (adjacent or separated, identical or differing in value
+//!   or critical flag) reject the certificate, and the error names that OID in
+//!   full dotted-decimal form; distinct OIDs with identical bodies still pass.
 //!
 //! Every case drives the real binary: success prints exactly the five fixed
 //! fields (no extension summary is added); failure is exit code 2, completely
@@ -416,6 +420,80 @@ fn extension_with_nonminimal_oid_is_rejected() {
     assert_invalid_certificate(&run_inspect("ext-oid-nonmin", &cert));
 }
 
+// ----- Failure: duplicate extension types -----------------------------------
+
+#[test]
+fn adjacent_identical_extensions_are_rejected() {
+    // Two byte-for-byte identical extensions carry the same extnID: the list
+    // is not a SET OF, so no picking or deduplicating is allowed.
+    let ext = extension(UNKNOWN_OID, None, &[0x30, 0x00]);
+    let cert = build_cert(Some(2), &extensions_field(&concat(&[&ext, &ext])));
+    assert_duplicate_oid(&run_inspect("dup-adjacent", &cert), "1.2.3.4");
+}
+
+#[test]
+fn same_oid_with_different_values_is_rejected() {
+    // Equality is decided by the OID alone; what the OCTET STRING carries is
+    // irrelevant. This is the 1.2.3.4, 2.5.29.14, 1.2.3.4 shape.
+    let first = extension(UNKNOWN_OID, None, &[0x30, 0x00]);
+    let middle = extension(&[2, 5, 29, 14], None, &[0x04, 0x02, 0xAA, 0xBB]);
+    let again = extension(UNKNOWN_OID, None, &[0x04, 0x03, 0x01, 0x02, 0x03]);
+    let cert = build_cert(
+        Some(2),
+        &extensions_field(&concat(&[&first, &middle, &again])),
+    );
+    assert_duplicate_oid(&run_inspect("dup-diff-value", &cert), "1.2.3.4");
+}
+
+#[test]
+fn same_oid_with_different_critical_flags_is_rejected() {
+    // One occurrence critical TRUE and the other with the default flag still
+    // name the same extension type.
+    let critical = extension(UNKNOWN_OID, Some(true), &[0x00]);
+    let plain = extension(UNKNOWN_OID, None, &[0x00]);
+    let cert = build_cert(
+        Some(2),
+        &extensions_field(&concat(&[&critical, &plain])),
+    );
+    assert_duplicate_oid(&run_inspect("dup-critical", &cert), "1.2.3.4");
+}
+
+#[test]
+fn duplicate_unknown_private_oid_is_rejected() {
+    // Every decodable OID is covered, private arcs included.
+    let oid: &[u64] = &[1, 2, 840, 99999, 7];
+    let first = extension(oid, None, &[0x01]);
+    let again = extension(oid, Some(true), &[0x02]);
+    let cert = build_cert(Some(2), &extensions_field(&concat(&[&first, &again])));
+    assert_duplicate_oid(&run_inspect("dup-private", &cert), "1.2.840.99999.7");
+}
+
+#[test]
+fn duplicate_oid_with_multibyte_arcs_is_rejected() {
+    // Arcs that need several base-128 bytes compare by their decoded values,
+    // and the error prints those values in full dotted-decimal form.
+    let oid: &[u64] = &[2, 999, 16384, 2097152];
+    let first = extension(oid, None, &[]);
+    let again = extension(oid, None, &[0xFF]);
+    let cert = build_cert(Some(2), &extensions_field(&concat(&[&first, &again])));
+    assert_duplicate_oid(
+        &run_inspect("dup-multibyte", &cert),
+        "2.999.16384.2097152",
+    );
+}
+
+// ----- Distinct OIDs stay accepted ------------------------------------------
+
+#[test]
+fn distinct_oids_with_identical_value_and_critical_flag_are_accepted() {
+    // Different complete OIDs may carry the same value and the same critical
+    // flag; only the OID decides a conflict.
+    let a = extension(UNKNOWN_OID, Some(true), &[0x30, 0x00]);
+    let b = extension(&[1, 2, 3, 5], Some(true), &[0x30, 0x00]);
+    let cert = build_cert(Some(2), &extensions_field(&concat(&[&a, &b])));
+    assert_success(&run_inspect("distinct-same-value", &cert));
+}
+
 // ----- Assertions / process plumbing ---------------------------------------
 
 fn assert_success(out: &Output) {
@@ -463,6 +541,26 @@ fn assert_invalid_certificate(out: &Output) {
     assert!(
         reason.to_ascii_lowercase().contains("extension"),
         "error reason must locate the failure in the extensions field: {reason}"
+    );
+}
+
+/// Failure assertion specific to a repeated extension type: the usual corrupt
+/// certificate contract (exit 2, empty stdout, fixed stderr prefix), plus a
+/// reason that names the repetition and the conflicting OID in full
+/// dotted-decimal form so it can be located.
+fn assert_duplicate_oid(out: &Output, oid: &str) {
+    assert_invalid_certificate(out);
+    let stderr = lossy(&out.stderr);
+    let reason = stderr
+        .strip_prefix("chainview: invalid DER certificate: ")
+        .unwrap();
+    assert!(
+        reason.to_ascii_lowercase().contains("duplicate"),
+        "reason must state that the extension type is duplicated: {reason}"
+    );
+    assert!(
+        reason.contains(oid),
+        "reason must name the repeated OID {oid} in full dotted-decimal form: {reason}"
     );
 }
 
