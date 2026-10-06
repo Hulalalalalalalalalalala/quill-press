@@ -735,62 +735,35 @@ mod x509 {
 
                 let oid_arcs = parse_oid(oid.content)?;
 
-                // The value's own type rules apply before any display decision:
-                // a PrintableString must hold only the RFC 5280 PrintableString
-                // alphabet, a BMPString must hold whole 16-bit BMP characters
-                // and a UniversalString must hold whole 32-bit Unicode code
-                // points, whether the attribute later renders as text for a
-                // known short name or as '#'-hex for an unknown type. The hex
-                // form must never let an illegal byte or code point through,
-                // and illegal content cannot be dropped or replaced. An empty
-                // value stays legal. `what` names the offending name
-                // ("subject"/"issuer").
-                if value.tag == TAG_PRINTABLE_STRING
-                    && !is_printable_string(value.content)
-                {
-                    return Err(format!(
-                        "{what} name: PrintableString attribute value contains an illegal \
-                         character (only A-Z, a-z, 0-9, space and ' ( ) + , - . / : = ? are \
-                         allowed)"
-                    ));
-                }
-                if value.tag == TAG_BMP_STRING {
-                    check_bmp_string(value.content, what)?;
-                }
-                if value.tag == TAG_UNIVERSAL_STRING {
-                    check_universal_string(value.content, what)?;
-                }
+                // Each supported string type has exactly one check-and-decode
+                // pass below: whether the attribute later renders as text (a
+                // known short name with a text type) or as '#'-hex (an unknown
+                // OID, or a known type with a non-text value) is decided only
+                // afterwards and never changes acceptance, so the hex form
+                // cannot let an illegal byte or code point through. A known
+                // type carrying any other readable DER value (SEQUENCE, OCTET
+                // STRING, ...) has no string rules at all and is shown as hex.
+                let decoded = check_and_decode_attribute_value(value, what)?;
 
-                match oid_short_name(&oid_arcs) {
-                    Some(label) => {
-                        if is_text_value_tag(value.tag) {
-                            // Supported string type: decode to escaped text.
-                            // A decode failure (e.g. invalid UTF-8) means the
-                            // certificate is corrupt; it must not be salvaged
-                            // by falling back to the hex form.
-                            let text = decode_attribute_value(value.tag, value.content)?;
-                            parts.push(format!("{label}={}", escape_value(&text)));
-                        } else {
-                            // Known type but a legal value with no text decoder
-                            // (SEQUENCE, OCTET STRING, ...): keep the short name
-                            // and show the full original DER encoding as '#'-hex.
-                            parts.push(format!("{label}=#{}", value_hex(after_oid, after_value)));
-                        }
+                match (oid_short_name(&oid_arcs), decoded) {
+                    (Some(label), Some(text)) => {
+                        // Known type with a supported string type: the
+                        // escaped decoded text.
+                        parts.push(format!("{label}={}", escape_value(&text)));
                     }
-                    None => {
+                    (Some(label), None) => {
+                        // Known type but a legal value with no text decoder
+                        // (SEQUENCE, OCTET STRING, ...): keep the short name
+                        // and show the full original DER encoding as '#'-hex.
+                        parts.push(format!("{label}=#{}", value_hex(after_oid, after_value)));
+                    }
+                    (None, _text_or_none) => {
                         // Unknown attribute type: RFC 4514 requires the form
                         // OID=#hex, where the hex is the full DER encoding
                         // (tag, length and content) of the attribute value.
-                        // Showing the value as hex does not bypass its type
-                        // rules: UTF8String content must be valid UTF-8, a
-                        // PrintableString must keep to its alphabet, a
-                        // BMPString must hold legal BMP characters and a
-                        // UniversalString must hold legal Unicode code points,
-                        // checks already performed above before this match.
-                        if value.tag == 0x0C {
-                            std::str::from_utf8(value.content)
-                                .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?;
-                        }
+                        // The value was already checked above, so the decoded
+                        // text (if any) is discarded and hex display never
+                        // bypasses the string type rules.
                         let hex = value_hex(after_oid, after_value);
                         parts.push(format!("{}=#{hex}", arcs_to_string(&oid_arcs)));
                     }
@@ -840,14 +813,145 @@ mod x509 {
         hex
     }
 
-    /// Tags whose attribute values have a direct text decoding in
-    /// `decode_attribute_value`. Every other tag that `read_tlv` accepts is a
-    /// legal non-text value for display purposes and is rendered as '#'-hex.
-    fn is_text_value_tag(tag: u8) -> bool {
-        matches!(
-            tag,
-            0x0C | 0x12 | 0x13 | 0x14 | 0x16 | 0x1A | 0x1B | 0x1C | 0x1E
-        )
+    /// Validate one attribute value against its own string type and, for the
+    /// supported string tags, decode it to UTF-8 text in the same pass. This is
+    /// the single place that maintains a string type's rules (its legal tag,
+    /// its legal bytes or code points, and its text decoding), so acceptance
+    /// can never depend on whether the attribute is later shown as text or as
+    /// '#'-hex: the check runs for every attribute before that display
+    /// decision, for both subject and issuer, and a decode failure (e.g.
+    /// invalid UTF-8) fails the whole certificate instead of salvaging the
+    /// value via the hex form.
+    ///
+    /// Returns `Some(text)` for the tags that have a text decoding
+    /// (UTF8String, NumericString, PrintableString, T61String, IA5String,
+    /// GeneralString, UniversalString, BMPString) and `None` for every other
+    /// tag that `read_tlv` accepts: those are legal, rule-free non-text values
+    /// (SEQUENCE, OCTET STRING, ...) that the caller renders as '#'-hex. An
+    /// empty string stays legal and decodes to empty text. `what` names the
+    /// name being checked ("subject" or "issuer") and appears in the messages
+    /// for types whose errors locate the name.
+    fn check_and_decode_attribute_value(
+        value: Tlv<'_>,
+        what: &str,
+    ) -> Result<Option<String>, String> {
+        let Tlv { tag, content } = value;
+        let text = match tag {
+            0x0C => {
+                // UTF8String: valid UTF-8, which then is already the output
+                // encoding. An empty value is valid and decodes to "".
+                std::str::from_utf8(content)
+                    .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?
+                    .to_string()
+            }
+            // PrintableString: every byte must belong to the RFC 5280
+            // alphabet, checked here in the same pass that maps the ASCII
+            // bytes to characters for the text form.
+            TAG_PRINTABLE_STRING => {
+                if !is_printable_string(content) {
+                    return Err(format!(
+                        "{what} name: PrintableString attribute value contains an illegal \
+                         character (only A-Z, a-z, 0-9, space and ' ( ) + , - . / : = ? are \
+                         allowed)"
+                    ));
+                }
+                // ASCII-family strings: every byte is also its Unicode code
+                // point, so a value that passed the alphabet check maps
+                // straight to characters.
+                content.iter().map(|&b| b as char).collect()
+            }
+            // NumericString, IA5String: no alphabet stricter than their bytes
+            // is enforced here; each byte is its own Unicode code point.
+            0x12 | 0x16 | 0x1A => content.iter().map(|&b| b as char).collect(),
+            // T.61 / GeneralString are conventionally treated as Latin-1 here.
+            0x14 | 0x1B => content.iter().map(|&b| b as char).collect(),
+            TAG_BMP_STRING => decode_bmp_string(content, what)?,
+            TAG_UNIVERSAL_STRING => decode_universal_string(content, what)?,
+            // Every other readable tag is a legal non-text value with no
+            // string rule and no text decoder (SEQUENCE, OCTET STRING, ...).
+            _ => return Ok(None),
+        };
+        Ok(Some(text))
+    }
+
+    /// Decode BMPString content to text while enforcing its rules: an even
+    /// number of bytes read as big-endian 16-bit characters, each of which
+    /// must be a Basic Multilingual Plane code point
+    /// (U+0000..=U+FFFF) and never a UTF-16 surrogate
+    /// (U+D800..=U+DFFF). Surrogates are not characters, so a lone high or
+    /// low surrogate is corrupt, and so is an adjacent pair that UTF-16 rules
+    /// would combine into an astral-plane character — the pair must not be
+    /// merged and displayed. An illegal value fails the whole certificate;
+    /// bytes are never dropped or replaced to salvage it. Empty content
+    /// decodes to "" and stays legal. `what` names the name being checked
+    /// ("subject"/"issuer") so the error identifies the offending name.
+    fn decode_bmp_string(content: &[u8], what: &str) -> Result<String, String> {
+        if content.len() % 2 != 0 {
+            return Err(format!(
+                "{what} name: BMPString attribute value has an odd length of {} byte(s) \
+                 (the content must be a sequence of 16-bit characters)",
+                content.len()
+            ));
+        }
+        let mut s = String::with_capacity(content.len() / 2);
+        for pair in content.chunks_exact(2) {
+            let unit = u16::from_be_bytes([pair[0], pair[1]]);
+            // A BMPString character is one big-endian 16-bit BMP code point,
+            // never a UTF-16 surrogate: surrogate pairs must not be merged
+            // into astral-plane characters.
+            if (0xD800..=0xDFFF).contains(&unit) {
+                return Err(format!(
+                    "{what} name: BMPString attribute value contains the surrogate code \
+                     point U+{unit:04X}, which is not a legal character (U+D800..=U+DFFF \
+                     are not characters and cannot appear, alone or in pairs)"
+                ));
+            }
+            // Surrogates have been rejected above, so the remaining BMP
+            // unit is always a scalar value and converts to a char.
+            s.push(char::from_u32(unit as u32).unwrap());
+        }
+        Ok(s)
+    }
+
+    /// Decode UniversalString content to text while enforcing its rules: the
+    /// bytes must form whole big-endian 32-bit Unicode code points, so the
+    /// length must be a multiple of four, and every code point must lie in
+    /// U+0000..=U+10FFFF and never be a UTF-16 surrogate
+    /// (U+D800..=U+DFFF). A trailing incomplete unit, a lone surrogate (or a
+    /// pair that UTF-16 rules would combine), or a value above the Unicode
+    /// ceiling is corrupt; the whole certificate fails and no unit is
+    /// dropped, replaced or merely hex-displayed to salvage it. Empty
+    /// content decodes to "" and stays legal. `what` names the name being
+    /// checked ("subject"/"issuer") so the error identifies the offending
+    /// name.
+    fn decode_universal_string(content: &[u8], what: &str) -> Result<String, String> {
+        if content.len() % 4 != 0 {
+            return Err(format!(
+                "{what} name: UniversalString attribute value has a length of {} byte(s), \
+                 which is not a multiple of four (the content must be a sequence of \
+                 big-endian 32-bit Unicode code points)",
+                content.len()
+            ));
+        }
+        let mut s = String::new();
+        for unit in content.chunks_exact(4) {
+            let cp = u32::from_be_bytes([unit[0], unit[1], unit[2], unit[3]]);
+            if (0xD800..=0xDFFF).contains(&cp) {
+                return Err(format!(
+                    "{what} name: UniversalString attribute value contains the surrogate code \
+                     point U+{cp:04X}, which is not a legal character (U+D800..=U+DFFF are \
+                     not characters and cannot appear, alone or in pairs)"
+                ));
+            }
+            if cp > 0x10FFFF {
+                return Err(format!(
+                    "{what} name: UniversalString attribute value contains the code point \
+                     U+{cp:04X}, which is above the Unicode maximum U+10FFFF"
+                ));
+            }
+            s.push(char::from_u32(cp).unwrap());
+        }
+        Ok(s)
     }
 
     fn parse_oid(content: &[u8]) -> Result<Vec<u64>, String> {
@@ -944,7 +1048,9 @@ mod x509 {
     /// A-Z, a-z, 0-9, space, and ' ( ) + , - . / : = ?. Every other byte
     /// (including @, _, tabs, newlines, NUL and 0x80..=0xFF) is illegal.
     /// An empty value passes, preserving the existing acceptance of empty
-    /// contents.
+    /// contents. This is the single statement of the PrintableString rule,
+    /// shared by the text path (known short name) and the hex path (unknown
+    /// OID) because `check_and_decode_attribute_value` runs it before either.
     fn is_printable_string(content: &[u8]) -> bool {
         content.iter().all(|&b| matches!(
             b,
@@ -964,125 +1070,6 @@ mod x509 {
                 | b'='
                 | b'?'
         ))
-    }
-
-    /// Validate BMPString content: an even number of bytes read as big-endian
-    /// 16-bit characters, each of which must be a Basic Multilingual Plane
-    /// code point (U+0000..=U+FFFF) and never a UTF-16 surrogate
-    /// (U+D800..=U+DFFF). Surrogates are not characters, so a lone high or
-    /// low surrogate is corrupt, and so is an adjacent pair that UTF-16
-    /// rules would combine into an astral-plane character — the pair must
-    /// not be merged and displayed. An illegal value fails the whole
-    /// certificate; bytes are never dropped or replaced to salvage it.
-    /// Empty content stays legal, preserving the existing acceptance of
-    /// empty values. `what` names the name being checked ("subject" or
-    /// "issuer") so the error identifies the offending name.
-    fn check_bmp_string(content: &[u8], what: &str) -> Result<(), String> {
-        if content.len() % 2 != 0 {
-            return Err(format!(
-                "{what} name: BMPString attribute value has an odd length of {} byte(s) \
-                 (the content must be a sequence of 16-bit characters)",
-                content.len()
-            ));
-        }
-        for pair in content.chunks_exact(2) {
-            let unit = u16::from_be_bytes([pair[0], pair[1]]);
-            if (0xD800..=0xDFFF).contains(&unit) {
-                return Err(format!(
-                    "{what} name: BMPString attribute value contains the surrogate code \
-                     point U+{unit:04X}, which is not a legal character (U+D800..=U+DFFF \
-                     are not characters and cannot appear, alone or in pairs)"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate UniversalString content: the bytes must form whole big-endian
-    /// 32-bit Unicode code points, so the length must be a multiple of four,
-    /// and every code point must lie in U+0000..=U+10FFFF and never be a
-    /// UTF-16 surrogate (U+D800..=U+DFFF). A trailing incomplete unit, a lone
-    /// surrogate (or a pair that UTF-16 rules would combine), or a value
-    /// above the Unicode ceiling is corrupt; the whole certificate fails and
-    /// no unit is dropped, replaced or merely hex-displayed to salvage it.
-    /// Empty content stays legal, preserving the existing acceptance of empty
-    /// values. `what` names the name being checked ("subject" or "issuer")
-    /// so the error identifies the offending name.
-    fn check_universal_string(content: &[u8], what: &str) -> Result<(), String> {
-        if content.len() % 4 != 0 {
-            return Err(format!(
-                "{what} name: UniversalString attribute value has a length of {} byte(s), \
-                 which is not a multiple of four (the content must be a sequence of \
-                 big-endian 32-bit Unicode code points)",
-                content.len()
-            ));
-        }
-        for unit in content.chunks_exact(4) {
-            let cp = u32::from_be_bytes([unit[0], unit[1], unit[2], unit[3]]);
-            if (0xD800..=0xDFFF).contains(&cp) {
-                return Err(format!(
-                    "{what} name: UniversalString attribute value contains the surrogate code \
-                     point U+{cp:04X}, which is not a legal character (U+D800..=U+DFFF are \
-                     not characters and cannot appear, alone or in pairs)"
-                ));
-            }
-            if cp > 0x10FFFF {
-                return Err(format!(
-                    "{what} name: UniversalString attribute value contains the code point \
-                     U+{cp:04X}, which is above the Unicode maximum U+10FFFF"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Decode a DirectoryString-style attribute value into UTF-8 text.
-    fn decode_attribute_value(tag: u8, content: &[u8]) -> Result<String, String> {
-        let s = match tag {
-            0x0C => std::str::from_utf8(content)
-                .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?
-                .to_string(),
-            // ASCII-family strings: every byte is also its Unicode code point.
-            0x12 | 0x13 | 0x16 | 0x1A => content.iter().map(|&b| b as char).collect(),
-            // T.61 / GeneralString are conventionally treated as Latin-1 here.
-            0x14 | 0x1B => content.iter().map(|&b| b as char).collect(),
-            0x1E => {
-                if content.len() % 2 != 0 {
-                    return Err("odd-length BMPString".to_string());
-                }
-                // A BMPString character is one big-endian 16-bit BMP code
-                // point, never a UTF-16 surrogate: surrogate pairs must not
-                // be merged into astral-plane characters.
-                let mut s = String::with_capacity(content.len() / 2);
-                for c in content.chunks_exact(2) {
-                    let unit = u16::from_be_bytes([c[0], c[1]]);
-                    let ch = char::from_u32(unit as u32)
-                        .ok_or_else(|| "surrogate code point in BMPString".to_string())?;
-                    s.push(ch);
-                }
-                s
-            }
-            0x1C => {
-                if content.len() % 4 != 0 {
-                    return Err("invalid UniversalString length".to_string());
-                }
-                let mut s = String::new();
-                for c in content.chunks_exact(4) {
-                    let cp = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
-                    if (0xD800..=0xDFFF).contains(&cp) || cp > 0x10FFFF {
-                        return Err("invalid code point in UniversalString".to_string());
-                    }
-                    s.push(char::from_u32(cp).unwrap());
-                }
-                s
-            }
-            _ => {
-                return Err(format!(
-                    "unsupported attribute value string type (tag 0x{tag:02X})"
-                ))
-            }
-        };
-        Ok(s)
     }
 
     /// RFC 4514 value escaping; everything above the ASCII control range
