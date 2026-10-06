@@ -548,6 +548,244 @@ fn utf8_and_universal_string_keep_legal_astral_characters() {
     assert_success(&out, "CN=\u{1F600}", "CN=Test CA");
 }
 
+// ----- UniversalString (tag 0x1C) character rules --------------------------
+
+#[test]
+fn universal_string_with_characters_displays_as_text() {
+    // Big-endian 32-bit code points, including CJK and an astral character,
+    // decode to text at a known attribute; the usual RFC 4514 escaping still
+    // applies to ','.
+    let content = universal_units(&[0x793A, 0x4F8B, 0x002C, 0x1F600]); // "示例,😀"
+    let subject = name(&[rdn(&[atv_universal(CN, &content)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("universal-legal", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=示例\\,😀", "CN=Test CA");
+}
+
+#[test]
+fn universal_string_for_unknown_oid_still_uses_full_der_hex() {
+    // The exact spec example: a legal UniversalString at an unknown OID is
+    // shown by encoding (never decoded to text): tag 0x1C, length and content
+    // in uppercase hex, here U+1F600 as 1C040001F600.
+    let subject = name(&[rdn(&[atv_universal(
+        &[1, 2, 3, 4],
+        &universal_units(&[0x1F600]),
+    )])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("universal-unknown", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "1.2.3.4=#1C040001F600", "CN=Test CA");
+}
+
+#[test]
+fn universal_string_for_unknown_oid_preserves_long_form_length() {
+    // A 128-byte UniversalString (32 code points) needs the long-form length
+    // 0x81 0x80; the hex must carry the original TLV header verbatim.
+    let content = universal_units(&vec![0x0041u32; 32]);
+    let subject = name(&[rdn(&[atv_universal(&[1, 2, 3, 4], &content)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("universal-unknown-longlen", &build_cert(&subject, &issuer));
+
+    let mut expected_hex = String::from("1C8180");
+    expected_hex.push_str(&"00000041".repeat(32));
+    assert_success(&out, &format!("1.2.3.4=#{expected_hex}"), "CN=Test CA");
+}
+
+#[test]
+fn empty_universal_string_is_accepted_in_both_forms() {
+    // Empty content stays legal for both kinds of attribute: a known type
+    // shows empty text, an unknown type shows the full empty TLV as #1C00.
+    let issuer = simple_cn_name("Test CA");
+
+    let subject = name(&[rdn(&[atv_universal(CN, &[])])]);
+    let (out, _cert) = run_inspect("universal-empty-known", &build_cert(&subject, &issuer));
+    assert_success(&out, "CN=", "CN=Test CA");
+
+    let subject = name(&[rdn(&[atv_universal(&[1, 2, 3, 4], &[])])]);
+    let (out, _cert) = run_inspect("universal-empty-unknown", &build_cert(&subject, &issuer));
+    assert_success(&out, "1.2.3.4=#1C00", "CN=Test CA");
+}
+
+#[test]
+fn truncated_length_universal_string_in_subject_is_rejected() {
+    // One, two and three trailing bytes cannot form whole 32-bit code points,
+    // even when a complete legal code point precedes the partial tail.
+    for tail in 1..=3usize {
+        let mut content = universal_units(&[0x0041]);
+        content.extend(std::iter::repeat_n(0x00u8, tail));
+        let subject = name(&[rdn(&[atv_universal(CN, &content)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) =
+            run_inspect("universal-len-subject", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        let stderr = lossy(&out.stderr);
+        assert!(
+            stderr.contains("subject") && stderr.contains("UniversalString"),
+            "tail of {tail} byte(s) must fail as a subject UniversalString error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn truncated_length_universal_string_in_issuer_is_rejected() {
+    // The same length rule applies to the Issuer name, and the reason names it.
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv_universal(CN, &[0x00, 0x61])])]);
+    let (out, _cert) = run_inspect("universal-len-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("UniversalString"),
+        "reason must name the issuer name and UniversalString: {stderr}"
+    );
+}
+
+#[test]
+fn surrogates_in_universal_string_are_rejected() {
+    // A lone high surrogate and a lone low surrogate are both illegal, even
+    // with legal code points on either side; nothing may be printed, replaced
+    // or stripped.
+    for cp in [0xD800u32, 0xDBFF, 0xDC00, 0xDFFF] {
+        let content = universal_units(&[0x0041, cp, 0x0042]);
+        let subject = name(&[rdn(&[atv_universal(CN, &content)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("universal-surr", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        let stderr = lossy(&out.stderr);
+        assert!(
+            stderr.contains("subject") && stderr.contains("UniversalString"),
+            "U+{cp:04X} must fail as a subject UniversalString error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn surrogate_pair_in_universal_string_is_rejected_not_merged() {
+    // UniversalString encodes code points directly, not UTF-16 units: the
+    // adjacent units U+D83D U+DE00 are two surrogate halves, each illegal, and
+    // must not be combined into U+1F600 the way UTF-16 would.
+    let content = universal_units(&[0xD83D, 0xDE00]);
+    let subject = name(&[rdn(&[atv_universal(CN, &content)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("universal-surr-pair", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("UniversalString"));
+}
+
+#[test]
+fn code_points_above_maximum_in_universal_string_are_rejected() {
+    // U+110000 is the first value past the Unicode maximum; larger 32-bit
+    // values are equally impossible. Legal code points around them do not
+    // salvage the value.
+    for cp in [0x00110000u32, 0x001FFFFF, 0x7FFFFFFF, 0xFFFFFFFF] {
+        let content = universal_units(&[0x0041, cp, 0x10FFFF]);
+        let subject = name(&[rdn(&[atv_universal(CN, &content)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) =
+            run_inspect("universal-over-max", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        let stderr = lossy(&out.stderr);
+        assert!(
+            stderr.contains("subject")
+                && stderr.contains("UniversalString")
+                && stderr.contains("10FFFF"),
+            "U+{cp:04X} must fail as an over-limit subject UniversalString error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn illegal_universal_string_at_unknown_oid_cannot_be_accepted_via_hex() {
+    // The regression: unknown attributes render as '#'-hex, but hex display is
+    // not an escape hatch — a partial trailing code point, a surrogate and an
+    // over-maximum code point must all fail even though the value would appear
+    // only as hex bytes.
+    for content in [
+        vec![0x00, 0x00, 0x00, 0x61, 0x00], // valid U+0061 then a 1-byte tail
+        universal_units(&[0x0041, 0xD800, 0x0042]),
+        universal_units(&[0x0041, 0x110000, 0x0042]),
+    ] {
+        let subject = name(&[rdn(&[atv_universal(&[1, 2, 3, 4], &content)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) =
+            run_inspect("universal-bad-unknown", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        assert!(lossy(&out.stderr).contains("UniversalString"));
+    }
+}
+
+#[test]
+fn illegal_universal_string_in_issuer_unknown_attribute_is_named() {
+    // The same hex-is-no-exception rule applies independently to the Issuer
+    // name, and the reason must name the issuer even though the subject is
+    // well-formed.
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv_universal(&[1, 2, 3, 4], &[0x00, 0x61])])]);
+    let (out, _cert) = run_inspect("universal-bad-unknown-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("UniversalString"),
+        "reason must name the issuer name and UniversalString: {stderr}"
+    );
+}
+
+#[test]
+fn illegal_universal_string_fails_among_legal_mixed_and_repeated_attributes() {
+    // A bad UniversalString attribute fails the whole certificate regardless
+    // of surrounding legal attributes: a leading legal RDN, a legal
+    // UniversalString attribute next to it and repeated attributes cannot
+    // mask it, and stdout must stay completely empty.
+    let subject = name(&[
+        rdn(&[atv_utf8(C, "CN")]),
+        rdn(&[
+            atv_universal(&[1, 2, 3, 4], &universal_units(&[0x1F600])),
+            atv_universal(&[1, 2, 3, 4], &universal_units(&[0x1F600, 0xD800])),
+            atv_utf8(CN, "example.com"),
+        ]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("universal-bad-mixed", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("UniversalString"));
+}
+
+#[test]
+fn legal_universal_string_mixes_and_repeats_with_other_attributes() {
+    // Legal UniversalString attributes keep all the normal name-display
+    // behavior: unknown attributes use '#'-hex in DER SET OF order, known
+    // attributes stay text, groups reverse on output and duplicates are not
+    // merged.
+    let subject = name(&[
+        rdn(&[
+            atv_universal(&[1, 2, 3, 4], &universal_units(&[0x0061, 0x0062])),
+            atv_utf8(CN, "example.com"),
+        ]),
+        rdn(&[
+            atv_universal(&[1, 2, 3, 4], &universal_units(&[0x1F600])),
+            atv_universal(&[1, 2, 3, 4], &universal_units(&[0x1F600])),
+        ]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("universal-legal-mixed", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "1.2.3.4=#1C040001F600+1.2.3.4=#1C040001F600,\
+         1.2.3.4=#1C080000006100000062+CN=example.com",
+        "CN=Test CA",
+    );
+}
+
 
 #[test]
 fn truncated_attribute_value_is_rejected() {
@@ -917,8 +1155,17 @@ fn atv_bmp(arcs: &[u64], content: &[u8]) -> Vec<u8> {
     atv(arcs, &tlv(0x1E, content))
 }
 
+fn atv_universal(arcs: &[u64], content: &[u8]) -> Vec<u8> {
+    atv(arcs, &tlv(0x1C, content))
+}
+
 /// Big-endian 16-bit units, the wire form of a BMPString's characters.
 fn bmp_units(units: &[u16]) -> Vec<u8> {
+    units.iter().flat_map(|u| u.to_be_bytes()).collect()
+}
+
+/// Big-endian 32-bit units, the wire form of a UniversalString's code points.
+fn universal_units(units: &[u32]) -> Vec<u8> {
     units.iter().flat_map(|u| u.to_be_bytes()).collect()
 }
 
