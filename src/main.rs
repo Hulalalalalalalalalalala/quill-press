@@ -115,6 +115,7 @@ mod x509 {
     const TAG_UTC_TIME: u8 = 0x17;
     const TAG_GENERALIZED_TIME: u8 = 0x18;
     const TAG_PRINTABLE_STRING: u8 = 0x13;
+    const TAG_UNIVERSAL_STRING: u8 = 0x1C;
     const TAG_BMP_STRING: u8 = 0x1E;
 
     /// Read exactly one DER TLV. Rejects indefinite length, non-minimal
@@ -715,12 +716,14 @@ mod x509 {
 
                 // The value's own type rules apply before any display decision:
                 // a PrintableString must hold only the RFC 5280 PrintableString
-                // alphabet, and a BMPString must hold whole 16-bit BMP
-                // characters, whether the attribute later renders as text for a
+                // alphabet, a BMPString must hold whole 16-bit BMP characters
+                // and a UniversalString must hold whole 32-bit Unicode code
+                // points, whether the attribute later renders as text for a
                 // known short name or as '#'-hex for an unknown type. The hex
-                // form must never let an illegal byte through, and an illegal
-                // byte cannot be dropped or replaced. An empty value stays
-                // legal. `what` names the offending name ("subject"/"issuer").
+                // form must never let an illegal byte or code point through,
+                // and illegal content cannot be dropped or replaced. An empty
+                // value stays legal. `what` names the offending name
+                // ("subject"/"issuer").
                 if value.tag == TAG_PRINTABLE_STRING
                     && !is_printable_string(value.content)
                 {
@@ -732,6 +735,9 @@ mod x509 {
                 }
                 if value.tag == TAG_BMP_STRING {
                     check_bmp_string(value.content, what)?;
+                }
+                if value.tag == TAG_UNIVERSAL_STRING {
+                    check_universal_string(value.content, what)?;
                 }
 
                 match oid_short_name(&oid_arcs) {
@@ -756,9 +762,10 @@ mod x509 {
                         // (tag, length and content) of the attribute value.
                         // Showing the value as hex does not bypass its type
                         // rules: UTF8String content must be valid UTF-8, a
-                        // PrintableString must keep to its alphabet and a
-                        // BMPString must hold legal BMP characters, checks
-                        // already performed above before this match.
+                        // PrintableString must keep to its alphabet, a
+                        // BMPString must hold legal BMP characters and a
+                        // UniversalString must hold legal Unicode code points,
+                        // checks already performed above before this match.
                         if value.tag == 0x0C {
                             std::str::from_utf8(value.content)
                                 .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?;
@@ -964,6 +971,44 @@ mod x509 {
                     "{what} name: BMPString attribute value contains the surrogate code \
                      point U+{unit:04X}, which is not a legal character (U+D800..=U+DFFF \
                      are not characters and cannot appear, alone or in pairs)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate UniversalString content: the bytes must form whole big-endian
+    /// 32-bit Unicode code points, so the length must be a multiple of four,
+    /// and every code point must lie in U+0000..=U+10FFFF and never be a
+    /// UTF-16 surrogate (U+D800..=U+DFFF). A trailing incomplete unit, a lone
+    /// surrogate (or a pair that UTF-16 rules would combine), or a value
+    /// above the Unicode ceiling is corrupt; the whole certificate fails and
+    /// no unit is dropped, replaced or merely hex-displayed to salvage it.
+    /// Empty content stays legal, preserving the existing acceptance of empty
+    /// values. `what` names the name being checked ("subject" or "issuer")
+    /// so the error identifies the offending name.
+    fn check_universal_string(content: &[u8], what: &str) -> Result<(), String> {
+        if content.len() % 4 != 0 {
+            return Err(format!(
+                "{what} name: UniversalString attribute value has a length of {} byte(s), \
+                 which is not a multiple of four (the content must be a sequence of \
+                 big-endian 32-bit Unicode code points)",
+                content.len()
+            ));
+        }
+        for unit in content.chunks_exact(4) {
+            let cp = u32::from_be_bytes([unit[0], unit[1], unit[2], unit[3]]);
+            if (0xD800..=0xDFFF).contains(&cp) {
+                return Err(format!(
+                    "{what} name: UniversalString attribute value contains the surrogate code \
+                     point U+{cp:04X}, which is not a legal character (U+D800..=U+DFFF are \
+                     not characters and cannot appear, alone or in pairs)"
+                ));
+            }
+            if cp > 0x10FFFF {
+                return Err(format!(
+                    "{what} name: UniversalString attribute value contains the code point \
+                     U+{cp:04X}, which is above the Unicode maximum U+10FFFF"
                 ));
             }
         }
