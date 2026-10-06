@@ -328,8 +328,8 @@ mod x509 {
         }
 
         let serial_hex = format_serial(serial.content)?;
-        let issuer = format_name(issuer)?;
-        let subject = format_name(subject)?;
+        let issuer = format_name(issuer, "issuer")?;
+        let subject = format_name(subject, "subject")?;
 
         let v = validity.content;
         let (nb, v2) = read_tlv(v)?;
@@ -629,7 +629,14 @@ mod x509 {
     /// name and uses the '#' form carrying the value's full DER encoding in
     /// hex. Attributes without a known short name use their dotted OID with
     /// the same '#' form.
-    fn format_name(name: Tlv) -> Result<String, String> {
+    ///
+    /// Each RDN is a SET OF AttributeTypeAndValue, so DER additionally
+    /// requires its members to appear in ascending order of their complete
+    /// encodings (tag, length and content compared as octet strings). The
+    /// check is purely byte-level: attribute names, dotted OIDs and decoded
+    /// values play no part in it, and identical members may repeat. `what`
+    /// names the enclosing field ("subject" or "issuer") for error messages.
+    fn format_name(name: Tlv, what: &str) -> Result<String, String> {
         let mut rdn_buf = name.content;
         let mut rdns: Vec<String> = Vec::new();
         while !rdn_buf.is_empty() {
@@ -638,9 +645,23 @@ mod x509 {
 
             let mut atv_buf = set.content;
             let mut parts = Vec::new();
+            let mut previous: Option<&[u8]> = None;
             while !atv_buf.is_empty() {
                 let (atv, rest) =
                     read_tagged(atv_buf, TAG_SEQUENCE, "AttributeTypeAndValue")?;
+                // The member's complete DER encoding, sliced from the SET
+                // content; `read_tagged` already proved it is complete.
+                let member = &atv_buf[..atv_buf.len() - rest.len()];
+                if let Some(previous) = previous {
+                    if previous > member {
+                        return Err(format!(
+                            "{what} name: attributes of a multi-valued RDN are not in \
+                             DER order (SET OF members must be sorted by their complete \
+                             DER encodings)"
+                        ));
+                    }
+                }
+                previous = Some(member);
                 atv_buf = rest;
 
                 let (oid, after_oid) = read_tagged(atv.content, TAG_OID, "attribute OID")?;
