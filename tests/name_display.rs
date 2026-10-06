@@ -415,6 +415,140 @@ fn non_ascii_and_at_still_display_in_utf8_string() {
     assert_success(&out, "CN=user@示例.test", "CN=Test CA");
 }
 
+// ----- BMPString (tag 0x1E) character rules --------------------------------
+
+#[test]
+fn bmp_string_with_bmp_characters_displays_as_text() {
+    // Big-endian 16-bit BMP characters, including CJK, decode to text; the
+    // usual RFC 4514 escaping still applies to ','.
+    let content = bmp_units(&[0x793A, 0x4F8B, 0x002C, 0x0041]); // "示例,A"
+    let subject = name(&[rdn(&[atv_bmp(CN, &content)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-legal", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=示例\\,A", "CN=Test CA");
+}
+
+#[test]
+fn bmp_string_for_unknown_oid_still_uses_full_der_hex() {
+    // A legal BMPString at an unknown OID is shown by encoding (never decoded
+    // to text): tag 0x1E, length and content in uppercase hex.
+    let subject = name(&[rdn(&[atv_bmp(&[1, 2, 3, 4], &bmp_units(&[0x0061, 0x0062]))])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-unknown", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "1.2.3.4=#1E0400610062", "CN=Test CA");
+}
+
+#[test]
+fn empty_bmp_string_is_accepted() {
+    // Empty content keeps the pre-existing acceptance: zero bytes is zero
+    // whole 16-bit characters.
+    let subject = name(&[rdn(&[atv_bmp(CN, &[])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-empty", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=", "CN=Test CA");
+}
+
+#[test]
+fn odd_length_bmp_string_in_subject_is_rejected() {
+    // Three content bytes cannot be whole 16-bit characters.
+    let subject = name(&[rdn(&[atv_bmp(CN, &[0x00, 0x61, 0x00])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-odd-subject", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("subject") && stderr.contains("BMPString"),
+        "reason must name the subject name and BMPString: {stderr}"
+    );
+}
+
+#[test]
+fn odd_length_bmp_string_in_issuer_is_rejected() {
+    // The same rule applies to the Issuer name, and the reason names it.
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv_bmp(CN, &[0x41])])]);
+    let (out, _cert) = run_inspect("bmp-odd-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("BMPString"),
+        "reason must name the issuer name and BMPString: {stderr}"
+    );
+}
+
+#[test]
+fn lone_surrogates_in_bmp_string_are_rejected() {
+    // A lone high surrogate and a lone low surrogate are both illegal, in
+    // either name; nothing may be printed, replaced or stripped.
+    for unit in [0xD800u16, 0xDBFF, 0xDC00, 0xDFFF] {
+        let content = bmp_units(&[0x0041, unit, 0x0042]);
+        let subject = name(&[rdn(&[atv_bmp(CN, &content)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("bmp-lone-surr", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        let stderr = lossy(&out.stderr);
+        assert!(
+            stderr.contains("subject") && stderr.contains("BMPString"),
+            "unit U+{unit:04X} must fail as a subject BMPString error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn surrogate_pair_in_bmp_string_is_rejected_not_merged() {
+    // U+D83D U+DE00 would combine into U+1F600 under UTF-16 rules, but a
+    // BMPString holds BMP characters only: the pair must fail the whole
+    // certificate, never be merged into an astral character and displayed.
+    let content = bmp_units(&[0xD83D, 0xDE00]);
+    let subject = name(&[rdn(&[atv_bmp(CN, &content)])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("bmp-surr-pair", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("BMPString"));
+}
+
+#[test]
+fn illegal_bmp_string_at_unknown_oid_cannot_be_accepted_via_hex() {
+    // Unknown attributes render as '#'-hex, but hex display is not an escape
+    // hatch: odd length and surrogate code points must fail even though the
+    // value would otherwise appear only as hex bytes.
+    for content in [
+        vec![0x00, 0x61, 0x00],          // odd length
+        bmp_units(&[0xD800, 0xDC00]),    // surrogate pair
+    ] {
+        let subject = name(&[rdn(&[atv_bmp(&[1, 2, 3, 4], &content)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("bmp-bad-unknown", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        assert!(lossy(&out.stderr).contains("BMPString"));
+    }
+}
+
+#[test]
+fn utf8_and_universal_string_keep_legal_astral_characters() {
+    // The BMPString restriction is type-specific: a UTF8String and a
+    // UniversalString may legally carry characters outside the BMP
+    // (U+1F600 here), which keep displaying as raw UTF-8.
+    let subject = name(&[rdn(&[atv_utf8(CN, "a\u{1F600}")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("utf8-astral", &build_cert(&subject, &issuer));
+    assert_success(&out, "CN=a\u{1F600}", "CN=Test CA");
+
+    let universal = atv(CN, &tlv(0x1C, &[0x00, 0x01, 0xF6, 0x00])); // U+1F600
+    let subject = name(&[rdn(&[universal])]);
+    let (out, _cert) = run_inspect("universal-astral", &build_cert(&subject, &issuer));
+    assert_success(&out, "CN=\u{1F600}", "CN=Test CA");
+}
+
+
 #[test]
 fn truncated_attribute_value_is_rejected() {
     // The value header announces five content bytes but only three follow;
@@ -777,6 +911,15 @@ fn atv_utf8(arcs: &[u64], text: &str) -> Vec<u8> {
 
 fn atv_printable(arcs: &[u64], bytes: &[u8]) -> Vec<u8> {
     atv(arcs, &tlv(0x13, bytes))
+}
+
+fn atv_bmp(arcs: &[u64], content: &[u8]) -> Vec<u8> {
+    atv(arcs, &tlv(0x1E, content))
+}
+
+/// Big-endian 16-bit units, the wire form of a BMPString's characters.
+fn bmp_units(units: &[u16]) -> Vec<u8> {
+    units.iter().flat_map(|u| u.to_be_bytes()).collect()
 }
 
 fn oid(arcs: &[u64]) -> Vec<u8> {
