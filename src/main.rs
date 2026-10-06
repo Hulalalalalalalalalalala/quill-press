@@ -114,6 +114,7 @@ mod x509 {
     const TAG_SET: u8 = 0x31;
     const TAG_UTC_TIME: u8 = 0x17;
     const TAG_GENERALIZED_TIME: u8 = 0x18;
+    const TAG_PRINTABLE_STRING: u8 = 0x13;
 
     /// Read exactly one DER TLV. Rejects indefinite length, non-minimal
     /// length encodings and truncated data.
@@ -664,6 +665,24 @@ mod x509 {
                 }
 
                 let oid_arcs = parse_oid(oid.content)?;
+
+                // The value's own type rules apply before any display decision:
+                // a PrintableString must hold only the RFC 5280 PrintableString
+                // alphabet, whether the attribute later renders as text for a
+                // known short name or as '#'-hex for an unknown type. The hex
+                // form must never let an illegal byte through, and an illegal
+                // byte cannot be dropped or replaced. An empty value stays
+                // legal. `what` names the offending name ("subject"/"issuer").
+                if value.tag == TAG_PRINTABLE_STRING
+                    && !is_printable_string(value.content)
+                {
+                    return Err(format!(
+                        "{what} name: PrintableString attribute value contains an illegal \
+                         character (only A-Z, a-z, 0-9, space and ' ( ) + , - . / : = ? are \
+                         allowed)"
+                    ));
+                }
+
                 match oid_short_name(&oid_arcs) {
                     Some(label) => {
                         if is_text_value_tag(value.tag) {
@@ -684,8 +703,10 @@ mod x509 {
                         // Unknown attribute type: RFC 4514 requires the form
                         // OID=#hex, where the hex is the full DER encoding
                         // (tag, length and content) of the attribute value.
-                        // The value is still validated: a UTF8String must
-                        // hold valid UTF-8 even when shown as hex.
+                        // Showing the value as hex does not bypass its type
+                        // rules: UTF8String content must be valid UTF-8 and a
+                        // PrintableString must keep to its alphabet, checks
+                        // already performed above before this match.
                         if value.tag == 0x0C {
                             std::str::from_utf8(value.content)
                                 .map_err(|_| "invalid UTF-8 in UTF8String".to_string())?;
@@ -837,6 +858,32 @@ mod x509 {
             _ => return None,
         };
         Some(name)
+    }
+
+    /// Whether every byte belongs to the RFC 5280 PrintableString alphabet:
+    /// A-Z, a-z, 0-9, space, and ' ( ) + , - . / : = ?. Every other byte
+    /// (including @, _, tabs, newlines, NUL and 0x80..=0xFF) is illegal.
+    /// An empty value passes, preserving the existing acceptance of empty
+    /// contents.
+    fn is_printable_string(content: &[u8]) -> bool {
+        content.iter().all(|&b| matches!(
+            b,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b' '
+                | b'\''
+                | b'('
+                | b')'
+                | b'+'
+                | b','
+                | b'-'
+                | b'.'
+                | b'/'
+                | b':'
+                | b'='
+                | b'?'
+        ))
     }
 
     /// Decode a DirectoryString-style attribute value into UTF-8 text.

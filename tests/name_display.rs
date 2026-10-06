@@ -306,6 +306,115 @@ fn invalid_utf8_in_known_attribute_value_is_rejected() {
     assert_invalid_certificate(&out);
 }
 
+// ----- PrintableString (tag 0x13) character rules --------------------------
+
+#[test]
+fn printable_string_with_legal_characters_displays_as_text() {
+    // Every character of the RFC 5280 PrintableString alphabet is accepted:
+    // letters, digits, space and ' ( ) + , - . / : = ?. The RFC 4514 text
+    // escaping is unchanged: '+' and ',' are escaped anywhere, and leading and
+    // trailing spaces keep their backslashes; the other punctuation passes
+    // through verbatim.
+    let subject = name(&[rdn(&[atv_printable(
+        CN,
+        b" John+Doe, Jr.'s (Section-1/2: A=B?) ",
+    )])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("printable-legal", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "CN=\\ John\\+Doe\\, Jr.'s (Section-1/2: A=B?)\\ ",
+        "CN=Test CA",
+    );
+}
+
+#[test]
+fn printable_string_for_unknown_oid_still_uses_full_der_hex() {
+    // A legal PrintableString at an unknown OID is still shown by encoding
+    // (never decoded to text): tag 0x13, length and content in uppercase hex.
+    let subject = name(&[rdn(&[atv_printable(&[1, 2, 3, 4], b"abc")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("printable-unknown", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "1.2.3.4=#1303616263", "CN=Test CA");
+}
+
+#[test]
+fn empty_printable_string_is_accepted() {
+    // Empty content keeps the pre-existing acceptance: the character check
+    // adds no extra failure for a zero-length value.
+    let subject = name(&[rdn(&[atv_printable(CN, b"")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("printable-empty", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=", "CN=Test CA");
+}
+
+#[test]
+fn illegal_bytes_in_subject_printable_string_are_rejected() {
+    // One illegal byte anywhere in a known attribute's PrintableString fails
+    // the whole certificate; the byte must never be printed, replaced or
+    // stripped. @, _, tab, LF, NUL and the whole 0x80..=0xFF range are all
+    // outside the alphabet even though many are otherwise printable bytes.
+    for bad in [
+        b'@', b'_', b'%', b'&', b'*', b'!', b'"', b';', b'<', b'>', b'\\', b'#', b'[',
+        b']', b'{', b'}', b'|', b'^', b'~', b'`', b'$', b'\t', b'\n', b'\r', 0x00, 0x01,
+        0x1F, 0x7F, 0x80, 0xA9, 0xC3, 0xFF,
+    ] {
+        let value = vec![b'a', bad, b'b'];
+        let subject = name(&[rdn(&[atv_printable(CN, &value)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("printable-bad-subject", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        let stderr = lossy(&out.stderr);
+        assert!(
+            stderr.contains("subject") && stderr.contains("PrintableString"),
+            "byte 0x{bad:02X} must fail as a subject PrintableString error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn illegal_byte_in_issuer_printable_string_is_rejected_and_named() {
+    // The same rule applies to the Issuer name, and the reason names it.
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv_printable(CN, b"bad_ca")])]);
+    let (out, _cert) = run_inspect("printable-bad-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("PrintableString"),
+        "reason must name the issuer name and PrintableString: {stderr}"
+    );
+}
+
+#[test]
+fn illegal_printable_string_at_unknown_oid_cannot_be_accepted_via_hex() {
+    // Unknown attributes render as '#'-hex, but hex display is not an escape
+    // hatch: a PrintableString containing '@' must fail even though the value
+    // would otherwise appear only as hex bytes.
+    let subject = name(&[rdn(&[atv_printable(&[1, 2, 3, 4], b"a@b")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("printable-bad-unknown", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("PrintableString"));
+}
+
+#[test]
+fn non_ascii_and_at_still_display_in_utf8_string() {
+    // The restriction is type-specific: a UTF8String may freely contain '@'
+    // and CJK text, which keeps displaying as raw UTF-8.
+    let subject = name(&[rdn(&[atv_utf8(CN, "user@示例.test")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("utf8-unaffected", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=user@示例.test", "CN=Test CA");
+}
+
 #[test]
 fn truncated_attribute_value_is_rejected() {
     // The value header announces five content bytes but only three follow;
@@ -664,6 +773,10 @@ fn atv(arcs: &[u64], value: &[u8]) -> Vec<u8> {
 
 fn atv_utf8(arcs: &[u64], text: &str) -> Vec<u8> {
     atv(arcs, &tlv(0x0C, text.as_bytes()))
+}
+
+fn atv_printable(arcs: &[u64], bytes: &[u8]) -> Vec<u8> {
+    atv(arcs, &tlv(0x13, bytes))
 }
 
 fn oid(arcs: &[u64]) -> Vec<u8> {
