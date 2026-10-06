@@ -443,24 +443,84 @@ mod x509 {
         Ok(())
     }
 
+    /// Why the content of an AlgorithmIdentifier SEQUENCE failed the shared
+    /// structural check in `split_algorithm_identifier`. Each variant carries
+    /// only the raw facts; every reader maps them onto its own established
+    /// error wording (the public-key position names "algorithm OID" and
+    /// "algorithm parameters", the signature algorithm positions name their
+    /// own location).
+    enum AlgIdError {
+        /// The leading OID element could not be read as one complete TLV.
+        OidRead(String),
+        /// The first element is present but is not an OID.
+        OidTag(u8),
+        /// The OID element exists but its content is not a valid OID
+        /// (empty, truncated or non-minimal base-128 arcs).
+        OidContent(String),
+        /// A parameter element follows the OID but cannot be read as one
+        /// complete TLV.
+        ParamsRead(String),
+        /// Bytes remain after the parameter element: parameters are one
+        /// OPTIONAL element, never several.
+        ExtraAfterParams,
+    }
+
+    /// Split the content of an AlgorithmIdentifier SEQUENCE into its
+    /// algorithm OID and optional parameters, enforcing the structure every
+    /// reader of an algorithm identifier shares:
+    ///
+    /// ```text
     /// AlgorithmIdentifier ::= SEQUENCE {
     ///   algorithm  OBJECT IDENTIFIER,
     ///   parameters ANY DEFINED BY algorithm OPTIONAL }
-    /// The parameters, if present, must be exactly one complete DER TLV;
-    /// absent parameters and an explicit NULL are both accepted. The
-    /// parameter content is not interpreted for any particular algorithm.
+    /// ```
+    ///
+    /// The content must start with one complete, shortest-encoded OID,
+    /// followed by either nothing or exactly one complete DER parameter
+    /// value, and nothing after that. Absent parameters and an explicit NULL
+    /// are both accepted and the parameter content is never interpreted for
+    /// any particular algorithm; an unknown but well-formed OID is accepted.
+    /// The parameter TLV is returned as its full original encoding (tag,
+    /// length and content), sliced straight from the input, so callers that
+    /// compare two identifiers can do so at the DER byte level.
+    fn split_algorithm_identifier(
+        content: &[u8],
+    ) -> Result<(Tlv<'_>, Option<&[u8]>), AlgIdError> {
+        let (oid, rest) = read_tlv(content).map_err(AlgIdError::OidRead)?;
+        if oid.tag != TAG_OID {
+            return Err(AlgIdError::OidTag(oid.tag));
+        }
+        parse_oid(oid.content).map_err(AlgIdError::OidContent)?;
+        let params = if rest.is_empty() {
+            None
+        } else {
+            let (_params, after) = read_tlv(rest).map_err(AlgIdError::ParamsRead)?;
+            if !after.is_empty() {
+                return Err(AlgIdError::ExtraAfterParams);
+            }
+            // Keep the full parameter TLV (tag, length and content), sliced
+            // straight from the enclosing content; `read_tlv` already proved
+            // it is a complete value.
+            Some(&rest[..rest.len() - after.len()])
+        };
+        Ok((oid, params))
+    }
+
+    /// Validate the AlgorithmIdentifier inside SubjectPublicKeyInfo: the
+    /// shared structure from `split_algorithm_identifier`, reported with the
+    /// public-key position's own wording.
     fn check_algorithm_identifier(alg: Tlv) -> Result<(), String> {
-        let (oid, rest) = read_tagged(alg.content, TAG_OID, "algorithm OID")?;
-        parse_oid(oid.content).map_err(|e| format!("algorithm OID: {e}"))?;
-        if rest.is_empty() {
-            return Ok(());
-        }
-        let (_params, after) =
-            read_tlv(rest).map_err(|e| format!("algorithm parameters: {e}"))?;
-        if !after.is_empty() {
-            return Err("multiple algorithm parameters".to_string());
-        }
-        Ok(())
+        split_algorithm_identifier(alg.content)
+            .map(|_| ())
+            .map_err(|e| match e {
+                AlgIdError::OidRead(e) => format!("algorithm OID: {e}"),
+                AlgIdError::OidTag(tag) => {
+                    format!("expected algorithm OID (tag 0x06), got 0x{tag:02X}")
+                }
+                AlgIdError::OidContent(e) => format!("algorithm OID: {e}"),
+                AlgIdError::ParamsRead(e) => format!("algorithm parameters: {e}"),
+                AlgIdError::ExtraAfterParams => "multiple algorithm parameters".to_string(),
+            })
     }
 
     /// One of the certificate's two signature algorithm descriptions, kept as
@@ -474,41 +534,27 @@ mod x509 {
         params: Option<&'a [u8]>,
     }
 
-    /// Parse and fully validate one signatureAlgorithm SEQUENCE: it must start
-    /// with one complete, shortest-encoded algorithm OID, followed by either
-    /// nothing or exactly one complete DER parameter value. `loc` names which
-    /// of the two copies is being checked ("outer signatureAlgorithm" or the
-    /// copy inside tbsCertificate) and prefixes every error message.
+    /// Parse and fully validate one signatureAlgorithm SEQUENCE, applying the
+    /// shared AlgorithmIdentifier structure from `split_algorithm_identifier`
+    /// and keeping the raw pieces for the byte-level comparison of the two
+    /// copies. `loc` names which of the two copies is being checked ("outer
+    /// signatureAlgorithm" or the copy inside tbsCertificate) and prefixes
+    /// every error message.
     fn parse_signature_algorithm<'a>(
         alg: Tlv<'a>,
         loc: &str,
     ) -> Result<SignatureAlgorithm<'a>, String> {
-        let (oid, rest) = read_tlv(alg.content).map_err(|e| format!("{loc}: {e}"))?;
-        if oid.tag != TAG_OID {
-            return Err(format!(
-                "{loc}: algorithm must start with an OID (tag 0x06), got tag 0x{:02X}",
-                oid.tag
-            ));
-        }
-        // Validates the OID content itself: non-empty, complete base-128 arcs
-        // in their shortest encoding.
-        parse_oid(oid.content).map_err(|e| format!("{loc}: {e}"))?;
-        let params = if rest.is_empty() {
-            None
-        } else {
-            let (_param, after) = read_tlv(rest)
-                .map_err(|e| format!("{loc}: algorithm parameters: {e}"))?;
-            if !after.is_empty() {
-                return Err(format!(
-                    "{loc}: extra element after the algorithm parameters"
-                ));
+        let (oid, params) = split_algorithm_identifier(alg.content).map_err(|e| match e {
+            AlgIdError::OidRead(e) => format!("{loc}: {e}"),
+            AlgIdError::OidTag(tag) => format!(
+                "{loc}: algorithm must start with an OID (tag 0x06), got tag 0x{tag:02X}"
+            ),
+            AlgIdError::OidContent(e) => format!("{loc}: {e}"),
+            AlgIdError::ParamsRead(e) => format!("{loc}: algorithm parameters: {e}"),
+            AlgIdError::ExtraAfterParams => {
+                format!("{loc}: extra element after the algorithm parameters")
             }
-            // Keep the full parameter TLV (tag, length and content), sliced
-            // straight from the enclosing content; `read_tlv` already proved
-            // it is a complete value.
-            let param_len = rest.len() - after.len();
-            Some(&rest[..param_len])
-        };
+        })?;
         Ok(SignatureAlgorithm {
             oid_content: oid.content,
             params,
