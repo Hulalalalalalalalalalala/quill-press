@@ -138,6 +138,105 @@ OID（包括私有标识和含多字节编码数字部分的标识）、关键�
 值和关键标志完全相同，仍允许共同出现。这一限制只作用于证书的扩展列表：
 主体或颁发者名称中重复的名称属性不受影响，仍按原规则保留。
 
+### 两处签名算法说明的对照检查
+
+一张 X.509 证书携带两处“签名算法说明”（ASN.1 的 `AlgorithmIdentifier`），
+`inspect` 会对这两处做对照检查：
+
+- 证书**最外层**的 `signatureAlgorithm`，位于 `tbsCertificate` 与
+  `signatureValue` 之间；
+- **待签名部分**（`tbsCertificate`）内部的 `signature` 字段。
+
+比较只发生在这两处各自携带的签名算法说明之间，**不是**拿签名算法与主体公钥
+算法比较。`subjectPublicKeyInfo` 里的主体公钥算法说明不参与这一对照：签名
+算法 OID 与主体公钥算法 OID 不同是完全正常的情形（例如主体公钥是
+`rsaEncryption`（1.2.840.113549.1.1.1），签名算法是
+`sha256WithRSAEncryption`（1.2.840.113549.1.1.11）），不会因此被拒绝。
+
+每一处说明本身都必须能**完整解码**成一个 `AlgorithmIdentifier`：开头必须
+有一个可完整解码的算法对象标识符（OID），其后要么完全没有参数，要么恰好
+有一个完整的参数值，参数之后不得再出现多余元素。缺少 OID、参数被截断，
+或 OID/参数之外出现多余元素，都会使该处无法解码并拒绝整张证书。OID 只要
+编码合法即可：工具不认识的未知 OID 仍可正常查看；接受它只表示编码通过，
+**并不表示工具支持用该算法验证签名**——`inspect` 本来就不做任何签名验证。
+
+两处都能独立解码之后，还要看它们是否“一致”，这里的一致是严格的编码一致：
+
+1. 算法标识符（OID）必须相同；
+2. 参数“出现与否”也必须相同；
+3. 两处都带参数时，比较的是参数的**完整 DER 编码**，包括标签、长度和内容，
+   逐字节相同才算一致。
+
+因此：
+
+- 两处都省略参数：接受；
+- 两处都带相同的显式 `NULL` 参数（`05 00`）：接受；
+- 一处省略参数、另一处写了显式 `NULL`：**拒绝**。“省略参数”和“显式
+  NULL”是两种不同的表示，工具不会把它们解释成相同含义后接受；
+- 两处 OID 不同：拒绝；
+- 两处都带参数但参数编码不同（标签、长度或内容任一不同；例如一个是
+  `NULL`、另一个是 `INTEGER 0`，或两个非 NULL 参数内容不同）：按完整
+  DER 编码比较，不一致即拒绝，错误信息会给出两处参数各自的完整十六进制
+  编码。
+
+其他类型的参数沿用同一条“完整 DER 编码逐字节比较”的规则；工具不解释
+某个算法参数的业务含义。
+
+下面是一组前后对照的例子。两张证书只有一处差别：第一张的两处都写
+`sha256WithRSAEncryption` 的 OID 并各带一个显式 `NULL`；第二张只把
+`tbsCertificate` 内那一处的参数改成整体省略（只保留 OID），其余字节不变。
+
+第一张，两处标识符相同且都带 `NULL`，正常输出既有的五行证书信息：
+
+```sh
+./target/debug/chainview inspect sigalgs-both-null.der
+```
+
+```text
+Subject: CN=example.com
+Issuer: CN=Test CA
+Serial Number: 0E8A4C2F9B17D603
+Not Before: 2026-01-15T09:30:00Z
+Not After: 2027-01-15T09:30:00Z
+```
+
+第二张，仅把其中一处（`tbsCertificate` 内的签名算法说明）改成省略参数，
+输出与当前功能一致的错误信息：
+
+```sh
+./target/debug/chainview inspect sigalgs-inner-absent.der
+```
+
+```text
+chainview: invalid DER certificate: signature algorithm mismatch: the outer signatureAlgorithm carries parameters but the signatureAlgorithm in tbsCertificate omits them (an absent parameter and an explicit value are different representations)
+```
+
+第二张证书里两处算法说明各自都能完整解码，并不是某一处编码损坏；它被
+拒绝，是因为两处都合法但**彼此不一致**（一处显式带参数、一处省略）。这类
+失败同样是退出码 `2`、标准输出为空，原因只写入标准错误。
+
+要注意把这种情况与“某一处编码本身损坏”区分开：
+
+- 若其中一处连一个完整的算法说明都解码不出来（空的 SEQUENCE、缺少 OID、
+  参数截断，或带有多余元素），错误信息会直接点名损坏的是哪一处，并描述
+  具体的解码故障，例如：
+
+  ```text
+  chainview: invalid DER certificate: tbs signatureAlgorithm: unexpected end of data
+  ```
+
+- 若错误信息以 `signature algorithm mismatch` 开头，则表示两处都能完整
+  解码、但两处的内部描述对不上（OID 不同，或参数表示/编码不同）。
+
+即：原因中出现 `outer signatureAlgorithm` 或 `tbs signatureAlgorithm` 并
+描述具体解码故障时，问题出在**那一处的编码损坏**；以 `mismatch` 表述时，
+问题是两处可解码但不一致。
+
+这一检查通过，只说明证书这一部分的编码以及两处内部描述彼此一致；它
+**不**说明签名真实有效、证书受信任，也不说明证书当前在有效期内。
+`inspect` 始终不验证签名、不判断信任；即使证书尚未生效或已经过期，只要
+DER 结构合法就仍可正常查看——过期证书照常输出上文所示的五行信息。
+
 ### 签名值位串
 
 证书最外层的 `signatureValue` 是一个 BIT STRING，`inspect` 不会对其做密码学
@@ -176,11 +275,17 @@ OID（包括私有标识和含多字节编码数字部分的标识）、关键�
   SET OF 顺序编码、主体或颁发者名称中的 `PrintableString` 含有非法字符、
   主体或颁发者名称中的 `BMPString` 长度为奇数或含有代理项码位、主体或
   颁发者名称中的 `UniversalString` 长度不是四的倍数、含有代理项码位或
-  码点超过 U+10FFFF、签名值 BIT STRING 缺少计数字节、计数超过 7、声明未使用
+  码点超过 U+10FFFF、两处签名算法说明中有一处无法完整解码（缺少 OID、
+  参数截断或含多余元素）、或两处签名算法说明都能解码但彼此不一致（算法
+  OID 不同、一处带参数而另一处省略，或两处都带参数但参数的完整 DER 编码
+  不同）、签名值 BIT STRING 缺少计数字节、计数超过 7、声明未使用
   位却没有数据或最后一个数据字节的未使用低位不为零、扩展列表中同一扩展 OID
   出现多次等）：
   退出码 `2`，标准错误输出
   `chainview: invalid DER certificate: <原因>`，原因会指明出错的是主体
-  还是颁发者名称；扩展 OID 重复时会给出该 OID 完整的点分十进制形式。
+  还是颁发者名称；扩展 OID 重复时会给出该 OID 完整的点分十进制形式；
+  签名算法问题会指出无法解码的是最外层还是 `tbsCertificate` 内的那一处，
+  或在两处都能解码但不一致时以 `signature algorithm mismatch` 说明分歧
+  （详见“两处签名算法说明的对照检查”）。
 
 所有失败情况下标准输出保持为空，原因只写入标准错误。
