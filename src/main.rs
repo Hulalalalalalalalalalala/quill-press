@@ -192,13 +192,13 @@ mod x509 {
         let (tbs, c) = read_tagged(c, TAG_SEQUENCE, "tbsCertificate")?;
         let (outer_alg, c) = read_tagged(c, TAG_SEQUENCE, "outer signatureAlgorithm")?;
         let outer_alg = parse_signature_algorithm(outer_alg, "outer signatureAlgorithm")?;
-        let (sig_value, c) = read_tlv(c)?;
-        if sig_value.tag != TAG_BIT_STRING {
-            return Err("signature must be a BIT STRING".to_string());
-        }
-        if sig_value.content.is_empty() || sig_value.content[0] > 7 {
-            return Err("invalid signature BIT STRING".to_string());
-        }
+        let (sig_value, c) = read_tagged(c, TAG_BIT_STRING, "signatureValue BIT STRING")?;
+        // The signature bytes are never cryptographically verified, but their
+        // BIT STRING encoding must be well formed: the leading unused-bits
+        // count is 0..=7, a nonzero count requires data, and the declared low
+        // bits of the final data byte must all be zero. Damage here rejects
+        // the whole certificate just like damage anywhere else.
+        check_bit_string(sig_value.content, "signatureValue")?;
         if !c.is_empty() {
             return Err("trailing data in Certificate".to_string());
         }
