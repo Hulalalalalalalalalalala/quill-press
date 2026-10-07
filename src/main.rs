@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::process::ExitCode;
 
@@ -36,28 +38,36 @@ fn usage() -> &'static str {
 }
 
 fn run() -> Result<(), Fail> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("--version") if args.len() == 1 => {
+    // Arguments are kept exactly as the OS handed them over: on Unix a file or
+    // directory name may contain bytes that are not valid UTF-8, and the path
+    // must be passed back to the OS verbatim. They are only lossily rendered
+    // for display, never for access.
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+    match args.first().map(OsString::as_os_str) {
+        Some(cmd) if cmd == "--version" && args.len() == 1 => {
             use std::io::Write;
             std::io::stdout()
                 .lock()
                 .write_all(b"chainview 0.1.0\n")
                 .map_err(|e| Fail::Output(e.to_string()))
         }
-        Some("inspect") => inspect(&args[1..]),
+        Some(cmd) if cmd == "inspect" => inspect(&args[1..]),
         _ => Err(Fail::Usage),
     }
 }
 
-fn inspect(args: &[String]) -> Result<(), Fail> {
+fn inspect(args: &[OsString]) -> Result<(), Fail> {
     let path = match args {
-        [path] if !path.starts_with('-') => path,
+        [path] if !starts_with_dash(path) => path.as_os_str(),
         _ => return Err(Fail::Usage),
     };
 
     let data = fs::read(path).map_err(|e| {
-        Fail::Read(format!("cannot read certificate file '{path}': {e}"))
+        // The real path bytes are used for access above; the diagnostic only
+        // needs a display form, where undecodable bytes become the replacement
+        // character without affecting which file was opened.
+        let shown = path_display(path);
+        Fail::Read(format!("cannot read certificate file '{shown}': {e}"))
     })?;
 
     let cert = x509::parse(&data).map_err(Fail::Cert)?;
@@ -85,6 +95,29 @@ fn inspect(args: &[String]) -> Result<(), Fail> {
         .write_all(out.as_bytes())
         .and_then(|_| stdout.flush())
         .map_err(|e| Fail::Output(e.to_string()))
+}
+
+/// Whether a raw path argument starts with an ASCII '-', the existing rule
+/// that rejects option-looking operands. On Unix the check reads the original
+/// OS bytes: recognizing the leading dash must not depend on the rest of the
+/// argument being valid UTF-8.
+#[cfg(unix)]
+fn starts_with_dash(path: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_bytes().first() == Some(&b'-')
+}
+
+#[cfg(not(unix))]
+fn starts_with_dash(path: &OsStr) -> bool {
+    path.to_str().is_some_and(|s| s.starts_with('-'))
+}
+
+/// Display-only rendering of a raw path for diagnostics. Bytes that cannot be
+/// decoded are shown as the replacement character; this form is never used to
+/// access the file, so its lossiness cannot redirect an open to a different
+/// name.
+fn path_display(path: &OsStr) -> Cow<'_, str> {
+    path.to_string_lossy()
 }
 
 /// Minimal, strict DER decoder and the slice of X.509 needed by `inspect`.
