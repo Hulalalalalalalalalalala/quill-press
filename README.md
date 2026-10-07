@@ -158,6 +158,73 @@ OID（包括私有标识和含多字节编码数字部分的标识）、关键�
 即使主体、颁发者、序列号和有效期都能正常读取，签名值位串编码损坏也会拒绝
 整张证书：不会删除、补零或改写损坏内容后再显示。
 
+### 两处签名算法说明的一致性
+
+一张 X.509 证书把签名算法写了**两次**：一次在证书最外层（`Certificate`
+的 `signatureAlgorithm` 字段），一次在待签名的 `tbsCertificate` 内部
+（其 `signature` 字段）。`inspect` 比较的是这两处各自携带的签名算法
+说明，**不是**拿签名算法与 `subjectPublicKeyInfo` 中的主体公钥算法比较：
+签名算法 OID 与公钥算法 OID 不同是完全正常的情况（例如 RSA 公钥搭配
+`sha256WithRSAEncryption` 签名），不影响查看。
+
+两处各自都必须是一个完整的算法标识符（AlgorithmIdentifier）：以一个可以
+完整解码的算法对象标识符（OID）开头，之后可以没有参数，也可以恰好有一个
+完整的参数值。缺少 OID、OID 或参数的编码被截断、参数之后还跟着多余元素，
+都按损坏的 DER 证书拒绝，错误信息会指明出问题的是哪一处
+（`outer signatureAlgorithm:` 或 `tbs signatureAlgorithm:` 开头）。未知但
+编码合法的算法 OID 仍可正常查看；接受它不代表本工具支持用该算法验证签名。
+
+两处“一致”的准确含义：
+
+- 两处的算法 OID 必须相同；
+- 参数是否出现也必须相同：两处都省略参数可以接受，两处都写相同的显式
+  `NULL` 参数也可以接受，但一处省略、另一处写 `NULL` 会被拒绝——不会把
+  这两种写法解释成相同含义后接受；
+- 两处都带参数时，比较的是参数的**完整 DER 编码**（标签、长度和内容），
+  逐字节相同才算一致；其他类型的参数沿用同一编码比较规则，工具不解释
+  某个算法的参数业务含义。
+
+前后对照的例子。`cert-match.der` 的两处说明都是
+`sha256WithRSAEncryption` 加显式 `NULL` 参数：
+
+```sh
+./target/debug/chainview inspect cert-match.der
+```
+
+```text
+Subject: CN=example.com
+Issuer: CN=Test CA
+Serial Number: 0E8A4C2F9B17D603
+Not Before: 2026-01-15T09:30:00Z
+Not After: 2027-01-15T09:30:00Z
+```
+
+退出码为 `0`。`cert-mismatch.der` 与前者只差一处：最外层仍带 `NULL`
+参数，而 `tbsCertificate` 内那一处省略了参数。此时：
+
+```sh
+./target/debug/chainview inspect cert-mismatch.der
+```
+
+标准输出为空，退出码为 `2`，标准错误输出：
+
+```text
+chainview: invalid DER certificate: signature algorithm mismatch: the outer signatureAlgorithm carries parameters but the signatureAlgorithm in tbsCertificate omits them (an absent parameter and an explicit value are different representations)
+```
+
+拒绝原因是两处对“参数是否存在”的表示不同，而不是任何一处无法解码。
+这与某一处的编码本身损坏是两类不同的失败：编码损坏时错误以
+`outer signatureAlgorithm:` 或 `tbs signatureAlgorithm:` 开头并指明损坏
+位置（例如 `outer signatureAlgorithm: algorithm parameters: truncated
+TLV content`）；两处各自都能正常解码、只是描述不一致时，错误才以
+`signature algorithm mismatch:` 开头。两种情况都遵循同一契约：退出码
+`2`、标准输出为空、原因只写入标准错误。
+
+即使主体、颁发者、序列号和有效期都能正常读取，两处签名算法说明损坏或
+不一致也会拒绝整张证书。这项检查通过只说明这两处编码合法且内部描述
+一致：它不说明签名真实有效、证书受信任或当前处于有效期内——`inspect`
+从不验证签名，过期或尚未生效的证书仍可正常查看。
+
 ### 失败与退出状态
 
 - 成功：退出码 `0`，证书信息写入标准输出。
@@ -178,9 +245,12 @@ OID（包括私有标识和含多字节编码数字部分的标识）、关键�
   颁发者名称中的 `UniversalString` 长度不是四的倍数、含有代理项码位或
   码点超过 U+10FFFF、签名值 BIT STRING 缺少计数字节、计数超过 7、声明未使用
   位却没有数据或最后一个数据字节的未使用低位不为零、扩展列表中同一扩展 OID
-  出现多次等）：
+  出现多次、某一处签名算法说明缺少 OID、OID 或参数编码截断或参数后有多余
+  元素、两处签名算法说明的 OID 不同或参数表示不一致等）：
   退出码 `2`，标准错误输出
   `chainview: invalid DER certificate: <原因>`，原因会指明出错的是主体
-  还是颁发者名称；扩展 OID 重复时会给出该 OID 完整的点分十进制形式。
+  还是颁发者名称；扩展 OID 重复时会给出该 OID 完整的点分十进制形式；
+  签名算法说明损坏时会指明是哪一处，两处描述不一致时以
+  `signature algorithm mismatch:` 开头说明分歧所在。
 
 所有失败情况下标准输出保持为空，原因只写入标准错误。
