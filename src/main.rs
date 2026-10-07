@@ -386,9 +386,10 @@ mod x509 {
 
         // Complete OIDs (parsed arcs) already seen in this list. DER mandates
         // one shortest encoding per OID and `parse_oid` enforces it, so equal
-        // arcs mean the same OID regardless of raw bytes; the list is short,
+        // arcs mean the same OID regardless of raw bytes; arcs are compared
+        // at full precision (no machine-integer limit), the list is short,
         // a linear scan keeps the representation simple.
-        let mut seen_oids: Vec<Vec<u64>> = Vec::new();
+        let mut seen_oids: Vec<Vec<Arc>> = Vec::new();
         let mut buf = list.content;
         while !buf.is_empty() {
             let (ext, rest) = read_tagged(buf, TAG_SEQUENCE, "extension")?;
@@ -818,28 +819,133 @@ mod x509 {
         hex
     }
 
-    fn parse_oid(content: &[u8]) -> Result<Vec<u64>, String> {
+    /// One OID arc (subidentifier) as an arbitrary-precision unsigned
+    /// integer. An OID arc has no upper bound in the standard: any
+    /// shortest-form base-128 subidentifier is legal, however many bits its
+    /// value needs, so the arcs are kept as exact bignums rather than a
+    /// machine integer whose range would become a false legality limit.
+    ///
+    /// `limbs` is little-endian base 2^32 with no trailing zero limbs; the
+    /// empty vector is zero. Normalization is maintained by every
+    /// constructor and mutator, so derived equality is value equality.
+    #[derive(Clone, PartialEq, Eq)]
+    struct Arc {
+        limbs: Vec<u32>,
+    }
+
+    impl Arc {
+        fn from_u64(value: u64) -> Arc {
+            let mut limbs = vec![value as u32, (value >> 32) as u32];
+            while limbs.last() == Some(&0) {
+                limbs.pop();
+            }
+            Arc { limbs }
+        }
+
+        /// The value as a `u64` when it fits, else `None`. Used only where a
+        /// small arc is required (the first subidentifier split and the
+        /// known-attribute table); large arcs simply take the other branch.
+        fn as_u64(&self) -> Option<u64> {
+            match self.limbs.len() {
+                0 => Some(0),
+                1 => Some(self.limbs[0] as u64),
+                2 => Some(self.limbs[0] as u64 | (self.limbs[1] as u64) << 32),
+                _ => None,
+            }
+        }
+
+        /// self = self * 128 + add (add < 128): one base-128 digit appended
+        /// while reading a subidentifier.
+        fn mul_add_128(&mut self, add: u32) {
+            let mut carry = add as u64;
+            for limb in &mut self.limbs {
+                let t = (*limb as u64) * 128 + carry;
+                *limb = t as u32;
+                carry = t >> 32;
+            }
+            while carry > 0 {
+                self.limbs.push(carry as u32);
+                carry >>= 32;
+            }
+        }
+
+        /// self = self - sub, where sub < 2^32 and self >= sub. Only used to
+        /// peel 40/80 off the first subidentifier once it is known to be
+        /// large enough.
+        fn sub_u32(&mut self, sub: u32) {
+            let mut borrow = sub as u64;
+            for limb in &mut self.limbs {
+                let cur = *limb as u64;
+                if cur >= borrow {
+                    *limb = (cur - borrow) as u32;
+                    borrow = 0;
+                    break;
+                }
+                *limb = (cur + (1u64 << 32) - borrow) as u32;
+                borrow = 1;
+            }
+            debug_assert_eq!(borrow, 0, "sub_u32 underflow");
+            while self.limbs.last() == Some(&0) {
+                self.limbs.pop();
+            }
+        }
+
+        /// Exact decimal rendering, by repeated division by 10^9.
+        fn to_decimal(&self) -> String {
+            if self.limbs.is_empty() {
+                return "0".to_string();
+            }
+            const CHUNK: u64 = 1_000_000_000;
+            let mut limbs = self.limbs.clone();
+            let mut chunks: Vec<u32> = Vec::new();
+            while !limbs.is_empty() {
+                let mut rem = 0u64;
+                for limb in limbs.iter_mut().rev() {
+                    let cur = (rem << 32) | (*limb as u64);
+                    *limb = (cur / CHUNK) as u32;
+                    rem = cur % CHUNK;
+                }
+                while limbs.last() == Some(&0) {
+                    limbs.pop();
+                }
+                chunks.push(rem as u32);
+            }
+            let mut s = chunks.last().unwrap().to_string();
+            for chunk in chunks.iter().rev().skip(1) {
+                write!(s, "{chunk:09}").unwrap();
+            }
+            s
+        }
+    }
+
+    fn parse_oid(content: &[u8]) -> Result<Vec<Arc>, String> {
         if content.is_empty() {
             return Err("empty OID".to_string());
         }
         let mut arcs = Vec::new();
         // The first subidentifier encodes the first two arcs as
         // 40*first + second and is itself a base-128 quantity, so it can
-        // span multiple content bytes (e.g. 2.999 encodes as 0x88 0x37).
+        // span multiple content bytes (e.g. 2.999 encodes as 0x88 0x37) and
+        // can exceed any machine integer width when the second arc is huge.
         let mut i = 0;
         let first = read_oid_arc(content, &mut i)?;
-        match first {
-            0..=39 => {
-                arcs.push(0);
-                arcs.push(first);
+        match first.as_u64() {
+            Some(v @ 0..=39) => {
+                arcs.push(Arc::from_u64(0));
+                arcs.push(Arc::from_u64(v));
             }
-            40..=79 => {
-                arcs.push(1);
-                arcs.push(first - 40);
+            Some(v @ 40..=79) => {
+                arcs.push(Arc::from_u64(1));
+                arcs.push(Arc::from_u64(v - 40));
             }
             _ => {
-                arcs.push(2);
-                arcs.push(first - 80);
+                // First arc 2: the second arc is the subidentifier minus 80,
+                // kept at full precision even when it needs more than 64
+                // bits.
+                let mut second = first;
+                second.sub_u32(80);
+                arcs.push(Arc::from_u64(2));
+                arcs.push(second);
             }
         }
         while i < content.len() {
@@ -849,18 +955,16 @@ mod x509 {
     }
 
     /// Read one base-128 subidentifier starting at `*i`. Rejects trailing
-    /// continuation bytes and non-minimal encodings.
-    fn read_oid_arc(content: &[u8], i: &mut usize) -> Result<u64, String> {
+    /// continuation bytes and non-minimal encodings; the value itself is
+    /// unbounded and kept exactly.
+    fn read_oid_arc(content: &[u8], i: &mut usize) -> Result<Arc, String> {
         let start = *i;
-        let mut value = 0u64;
+        let mut value = Arc { limbs: Vec::new() };
         loop {
             let b = *content
                 .get(*i)
                 .ok_or_else(|| "truncated OID arc".to_string())?;
-            value = value
-                .checked_mul(128)
-                .and_then(|v| v.checked_add((b & 0x7F) as u64))
-                .ok_or_else(|| "OID arc overflow".to_string())?;
+            value.mul_add_128((b & 0x7F) as u32);
             *i += 1;
             if b & 0x80 == 0 {
                 break;
@@ -872,37 +976,40 @@ mod x509 {
         Ok(value)
     }
 
-    fn arcs_to_string(arcs: &[u64]) -> String {
+    fn arcs_to_string(arcs: &[Arc]) -> String {
         arcs.iter()
-            .map(u64::to_string)
+            .map(Arc::to_decimal)
             .collect::<Vec<_>>()
             .join(".")
     }
 
-    fn oid_short_name(arcs: &[u64]) -> Option<&'static str> {
+    fn oid_short_name(arcs: &[Arc]) -> Option<&'static str> {
+        // The known names all live far below 2^64; any arc that does not fit
+        // a u64 cannot match, which falls out of the conversion for free.
+        let small: Option<Vec<u64>> = arcs.iter().map(Arc::as_u64).collect();
         // X.520 / X.521 (2.5.4.*) and the commonly used LDAP/PKCS names.
-        let name = match arcs {
-            [2, 5, 4, 3] => "CN",
-            [2, 5, 4, 4] => "SN",
-            [2, 5, 4, 5] => "serialNumber",
-            [2, 5, 4, 6] => "C",
-            [2, 5, 4, 7] => "L",
-            [2, 5, 4, 8] => "ST",
-            [2, 5, 4, 9] => "STREET",
-            [2, 5, 4, 10] => "O",
-            [2, 5, 4, 11] => "OU",
-            [2, 5, 4, 12] => "title",
-            [2, 5, 4, 17] => "postalAddress",
-            [2, 5, 4, 18] => "postalCode",
-            [2, 5, 4, 20] => "telephoneNumber",
-            [2, 5, 4, 42] => "givenName",
-            [2, 5, 4, 43] => "initials",
-            [2, 5, 4, 44] => "generationQualifier",
-            [2, 5, 4, 46] => "dnQualifier",
-            [2, 5, 4, 65] => "pseudonym",
-            [0, 9, 2342, 19200300, 100, 1, 1] => "UID",
-            [0, 9, 2342, 19200300, 100, 1, 25] => "DC",
-            [1, 2, 840, 113549, 1, 9, 1] => "emailAddress",
+        let name = match small.as_deref() {
+            Some([2, 5, 4, 3]) => "CN",
+            Some([2, 5, 4, 4]) => "SN",
+            Some([2, 5, 4, 5]) => "serialNumber",
+            Some([2, 5, 4, 6]) => "C",
+            Some([2, 5, 4, 7]) => "L",
+            Some([2, 5, 4, 8]) => "ST",
+            Some([2, 5, 4, 9]) => "STREET",
+            Some([2, 5, 4, 10]) => "O",
+            Some([2, 5, 4, 11]) => "OU",
+            Some([2, 5, 4, 12]) => "title",
+            Some([2, 5, 4, 17]) => "postalAddress",
+            Some([2, 5, 4, 18]) => "postalCode",
+            Some([2, 5, 4, 20]) => "telephoneNumber",
+            Some([2, 5, 4, 42]) => "givenName",
+            Some([2, 5, 4, 43]) => "initials",
+            Some([2, 5, 4, 44]) => "generationQualifier",
+            Some([2, 5, 4, 46]) => "dnQualifier",
+            Some([2, 5, 4, 65]) => "pseudonym",
+            Some([0, 9, 2342, 19200300, 100, 1, 1]) => "UID",
+            Some([0, 9, 2342, 19200300, 100, 1, 25]) => "DC",
+            Some([1, 2, 840, 113549, 1, 9, 1]) => "emailAddress",
             _ => return None,
         };
         Some(name)
