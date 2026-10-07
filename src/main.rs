@@ -1,5 +1,7 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -36,28 +38,41 @@ fn usage() -> &'static str {
 }
 
 fn run() -> Result<(), Fail> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("--version") if args.len() == 1 => {
+    // Arguments are taken exactly as the operating system delivered them:
+    // `env::args()` (which yields `String`) aborts on a Unix argument whose
+    // bytes are not valid UTF-8, but a file name is allowed to contain such
+    // bytes. Commands are matched as OS strings, and the file argument is
+    // handed to the OS untouched; its bytes are rendered as text only for the
+    // human-readable read-error message.
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+    match args.first().map(|a| a.as_encoded_bytes()) {
+        Some(b"--version") if args.len() == 1 => {
             use std::io::Write;
             std::io::stdout()
                 .lock()
                 .write_all(b"chainview 0.1.0\n")
                 .map_err(|e| Fail::Output(e.to_string()))
         }
-        Some("inspect") => inspect(&args[1..]),
+        Some(b"inspect") => inspect(&args[1..]),
         _ => Err(Fail::Usage),
     }
 }
 
-fn inspect(args: &[String]) -> Result<(), Fail> {
+fn inspect(args: &[OsString]) -> Result<(), Fail> {
     let path = match args {
-        [path] if !path.starts_with('-') => path,
+        // A path argument that begins with '-' stays a usage error under the
+        // existing rule; '-' itself is the first byte of the encoded OS
+        // string, so the check is independent of UTF-8 validity.
+        [path] if !path.as_encoded_bytes().starts_with(b"-") => Path::new(path),
         _ => return Err(Fail::Usage),
     };
 
+    // Access the file through the exact bytes the user supplied; they are
+    // converted to a lossy display string only when (and if) the read fails,
+    // so an unrepresentable byte can never alter the path that is opened.
     let data = fs::read(path).map_err(|e| {
-        Fail::Read(format!("cannot read certificate file '{path}': {e}"))
+        let display = path.as_os_str().to_string_lossy();
+        Fail::Read(format!("cannot read certificate file '{display}': {e}"))
     })?;
 
     let cert = x509::parse(&data).map_err(Fail::Cert)?;
