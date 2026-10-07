@@ -196,9 +196,13 @@ mod x509 {
         if sig_value.tag != TAG_BIT_STRING {
             return Err("signature must be a BIT STRING".to_string());
         }
-        if sig_value.content.is_empty() || sig_value.content[0] > 7 {
-            return Err("invalid signature BIT STRING".to_string());
-        }
+        // The signature is never cryptographically verified, but its BIT
+        // STRING must still be strict DER: a present count byte in 0..=7,
+        // data whenever unused bits are declared, and zeroes in the declared
+        // unused low bits of the final data byte. This is the same check the
+        // subjectPublicKey BIT STRING receives; only the encoding is judged,
+        // never the signature bytes' cryptographic meaning.
+        check_bit_string(sig_value.content, "signatureValue")?;
         if !c.is_empty() {
             return Err("trailing data in Certificate".to_string());
         }
