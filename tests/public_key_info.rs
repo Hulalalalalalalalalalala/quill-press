@@ -108,6 +108,34 @@ fn spki_with_unknown_but_decodable_algorithm_oid_is_accepted() {
     assert_success(&out);
 }
 
+// ----- Arcs wider than any machine integer ---------------------------------
+//
+// A legal OID arc is an arbitrarily large base-128 integer; the public-key
+// algorithm OID must not be rejected merely because an arc is past u64::MAX.
+// Raw OID content bytes are used because the test DER builder works in u64.
+// 2^64 encodes shortest-form as 82 80 80 80 80 80 80 80 80 00.
+
+/// OID 1.2.18446744073709551616.7 content: first pair 42, then arc 2^64, 7.
+const BIG_ALG_OID_CONTENT: &[u8] = &[
+    0x2A, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x07,
+];
+
+#[test]
+fn spki_algorithm_oid_with_beyond_u64_arc_is_accepted() {
+    // An unrecognized key algorithm whose OID carries a 2^64 arc is still a
+    // well-formed AlgorithmIdentifier, with and without parameters.
+    let spki = spki_of(
+        &alg_with_oid_raw(BIG_ALG_OID_CONTENT, Some(&tlv(0x05, &[]))),
+        &default_key(),
+    );
+    let (out, _cert) = run_inspect("big-arc-null", &build_cert(&spki));
+    assert_success(&out);
+
+    let spki = spki_of(&alg_with_oid_raw(BIG_ALG_OID_CONTENT, None), &default_key());
+    let (out, _cert) = run_inspect("big-arc-absent", &build_cert(&spki));
+    assert_success(&out);
+}
+
 // ----- Success: BIT STRING unused-bits encoding ----------------------------
 
 #[test]
@@ -451,6 +479,16 @@ fn alg_with_null_params(arcs: &[u64]) -> Vec<u8> {
 /// AlgorithmIdentifier with one caller-supplied complete parameter TLV.
 fn alg_with(arcs: &[u64], params: &[u8]) -> Vec<u8> {
     seq(&concat(&[&oid(arcs), params]))
+}
+
+/// AlgorithmIdentifier whose OID content bytes are supplied directly (needed
+/// for arcs wider than `u64`), followed by `params` if any.
+fn alg_with_oid_raw(oid_content: &[u8], params: Option<&[u8]>) -> Vec<u8> {
+    let oid_tlv = tlv(0x06, oid_content);
+    match params {
+        Some(params) => seq(&concat(&[&oid_tlv, params])),
+        None => seq(&oid_tlv),
+    }
 }
 
 /// BIT STRING carrying the supplied content (unused-bits count plus data).

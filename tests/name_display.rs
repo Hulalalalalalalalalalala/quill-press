@@ -76,6 +76,114 @@ fn unknown_oid_under_2_999_keeps_numeric_arcs() {
     assert_success(&out, "2.999.1=#0C0178", "CN=Test CA");
 }
 
+// ----- Arcs wider than any machine integer ---------------------------------
+//
+// A legal OID arc is an arbitrarily large base-128 integer; DER sets no
+// machine-width ceiling. Such an arc must be preserved exactly (never
+// truncated, wrapped, approximated or replaced with placeholder text) and
+// shown as its precise dotted-decimal value. The bytes below are the shortest
+// encodings of values past u64::MAX:
+//   2^64            = 82 80 80 80 80 80 80 80 80 00
+//   2^64 + 80       = 82 80 80 80 80 80 80 80 80 50   (first pair 2.2^64)
+
+#[test]
+fn unknown_oid_with_second_arc_past_u64_keeps_exact_value() {
+    // The exact spec example: attribute type 2.18446744073709551616.3 (the
+    // second arc is 2^64) with a UTF8String "abc" renders as
+    // 2.18446744073709551616.3=#0C03616263. The first two arcs are encoded
+    // together as 2^64 + 80; both the combined value and the second arc are
+    // past u64::MAX and must stay exact.
+    let raw_oid_content = &[
+        0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x50, 0x03,
+    ];
+    let subject = name(&[rdn(&[atv_raw_oid(raw_oid_content, &tlv(0x0C, b"abc"))])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("unknown-huge-second-arc", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "2.18446744073709551616.3=#0C03616263",
+        "CN=Test CA",
+    );
+}
+
+#[test]
+fn unknown_oid_with_beyond_u64_arc_in_a_later_position_keeps_exact_value() {
+    // The same bound applies no matter where the large arc stands:
+    // 1.2.3.18446744073709551616 (the last arc is 2^64).
+    let raw_oid_content = &[
+        0x2A, 0x03, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+    ];
+    let subject = name(&[rdn(&[atv_raw_oid(raw_oid_content, &tlv(0x0C, b"abc"))])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("unknown-huge-later-arc", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "1.2.3.18446744073709551616=#0C03616263",
+        "CN=Test CA",
+    );
+}
+
+#[test]
+fn second_arc_fits_u64_but_first_pair_combined_overflows_is_accepted() {
+    // The second arc itself (2^64 - 80) still fits in 64 bits, but the
+    // encoded first subidentifier (40*2 + second = 2^64) does not. The
+    // machine-integer range of the combined encoding is not a legal-OID
+    // limit, so the certificate must display with the exact second arc.
+    let raw_oid_content = &[
+        0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x03,
+    ];
+    let subject = name(&[rdn(&[atv_raw_oid(raw_oid_content, &tlv(0x0C, b"abc"))])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("unknown-combined-overflow", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "2.18446744073709551536.3=#0C03616263",
+        "CN=Test CA",
+    );
+}
+
+#[test]
+fn very_wide_arc_is_preserved_with_exact_decimal() {
+    // An arc of 2^256 (37 base-128 bytes) must render its full 78-digit
+    // decimal value rather than any fixed-width approximation. The first
+    // subidentifier encodes 40*2 + second, so it carries 2^256 + 80
+    // (terminator 0x50), recovering a second arc of exactly 2^256.
+    let mut raw_oid_content = vec![0x90];
+    raw_oid_content.extend(std::iter::repeat_n(0x80, 35));
+    raw_oid_content.push(0x50); // terminator for the first pair
+    raw_oid_content.push(0x03); // a small following arc
+    let subject = name(&[rdn(&[atv_raw_oid(&raw_oid_content, &tlv(0x0C, b"abc"))])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("unknown-256bit-arc", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "2.115792089237316195423570985008687907853269984665640564039457584007913129639936.3=#0C03616263",
+        "CN=Test CA",
+    );
+}
+
+#[test]
+fn nonminimal_beyond_u64_arc_is_still_rejected() {
+    // A large arc does not relax DER's shortest-form rule: a leading 0x80
+    // zero group in front of the 2^64 encoding is an extra leading zero and
+    // stays corrupt.
+    let mut raw_oid_content = vec![0x80]; // leading zero group
+    raw_oid_content.extend_from_slice(&[
+        0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+    ]);
+    raw_oid_content.push(0x03);
+    let subject = name(&[rdn(&[atv_raw_oid(&raw_oid_content, &tlv(0x0C, b"abc"))])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("unknown-huge-nonmin", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("non-minimal OID arc"));
+}
+
 #[test]
 fn unknown_non_string_value_is_shown_as_full_der_hex() {
     // An OCTET STRING value (tag 0x04) is not text at all; the full encoding
@@ -1172,6 +1280,12 @@ fn rdn(atvs: &[Vec<u8>]) -> Vec<u8> {
 /// complete DER TLV of the value.
 fn atv(arcs: &[u64], value: &[u8]) -> Vec<u8> {
     seq(&concat(&[&oid(arcs), value]))
+}
+
+/// Like `atv`, but the OID's raw content bytes (already base-128 encoded) are
+/// supplied directly so arcs wider than `u64` can be exercised.
+fn atv_raw_oid(oid_content: &[u8], value: &[u8]) -> Vec<u8> {
+    seq(&concat(&[&tlv(0x06, oid_content), value]))
 }
 
 fn atv_utf8(arcs: &[u64], text: &str) -> Vec<u8> {

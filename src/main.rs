@@ -89,6 +89,7 @@ fn inspect(args: &[String]) -> Result<(), Fail> {
 
 /// Minimal, strict DER decoder and the slice of X.509 needed by `inspect`.
 mod x509 {
+    use std::cmp::Ordering;
     use std::fmt::Write;
 
     pub(super) struct Cert {
@@ -387,8 +388,10 @@ mod x509 {
         // Complete OIDs (parsed arcs) already seen in this list. DER mandates
         // one shortest encoding per OID and `parse_oid` enforces it, so equal
         // arcs mean the same OID regardless of raw bytes; the list is short,
-        // a linear scan keeps the representation simple.
-        let mut seen_oids: Vec<Vec<u64>> = Vec::new();
+        // a linear scan keeps the representation simple. Arc values are exact
+        // arbitrary-precision integers, so two OIDs that differ only in a huge
+        // arc are still distinct and never collapse into a false duplicate.
+        let mut seen_oids: Vec<Vec<OidArc>> = Vec::new();
         let mut buf = list.content;
         while !buf.is_empty() {
             let (ext, rest) = read_tagged(buf, TAG_SEQUENCE, "extension")?;
@@ -818,7 +821,97 @@ mod x509 {
         hex
     }
 
-    fn parse_oid(content: &[u8]) -> Result<Vec<u64>, String> {
+    /// One OID subidentifier (arc) of unbounded size, kept as the exact value
+    /// in base 2^64 (least-significant limb first) with no leading zero limbs.
+    /// A legal OID arc is an arbitrarily large non-negative integer: DER puts
+    /// no machine-width ceiling on it, so decoding must not impose one. The
+    /// value is preserved exactly — never truncated, wrapped, approximated or
+    /// replaced with placeholder text — and rendered as its exact decimal.
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct OidArc {
+        limbs: Vec<u64>,
+    }
+
+    impl OidArc {
+        fn zero() -> Self {
+            OidArc { limbs: Vec::new() }
+        }
+
+        fn from_u64(value: u64) -> Self {
+            OidArc {
+                limbs: if value == 0 { Vec::new() } else { vec![value] },
+            }
+        }
+
+        /// Multiply this value by 128 and add `add` (0..=127), in place. With
+        /// 64-bit limbs this shift-and-add never needs a temporary wider than
+        /// 128 bits, so a `u128` carry is exact.
+        fn mul_128_add(&mut self, add: u64) {
+            let mut carry = add;
+            for limb in &mut self.limbs {
+                let wide = (*limb as u128) * 128 + carry as u128;
+                *limb = wide as u64;
+                carry = (wide >> 64) as u64;
+            }
+            if carry != 0 {
+                self.limbs.push(carry);
+            }
+        }
+
+        /// Compare against a small constant, used for the first two arcs.
+        fn cmp_u64(&self, other: u64) -> Ordering {
+            match self.limbs.len() {
+                0 => 0u64.cmp(&other),
+                1 => self.limbs[0].cmp(&other),
+                _ => Ordering::Greater,
+            }
+        }
+
+        /// Subtract a small constant that the value is known to be at least,
+        /// used to recover the second arc from the encoded first pair.
+        fn sub_u64(&mut self, other: u64) {
+            let mut borrow = other;
+            for limb in &mut self.limbs {
+                let (new, borrowed) = limb.overflowing_sub(borrow);
+                *limb = new;
+                borrow = u64::from(borrowed);
+            }
+            debug_assert_eq!(borrow, 0, "subtraction underflow on OID arc");
+            self.trim();
+        }
+
+        fn trim(&mut self) {
+            while self.limbs.last() == Some(&0) {
+                self.limbs.pop();
+            }
+        }
+
+        /// Exact decimal rendering: repeatedly divide the base-2^64 value by
+        /// 10, collecting remainder digits, then reverse them.
+        fn to_decimal(&self) -> String {
+            if self.limbs.is_empty() {
+                return "0".to_string();
+            }
+            let mut limbs = self.limbs.clone();
+            let mut digits = Vec::new();
+            while !limbs.is_empty() {
+                let mut remainder: u64 = 0;
+                for limb in limbs.iter_mut().rev() {
+                    let wide = (remainder as u128) << 64 | *limb as u128;
+                    *limb = (wide / 10) as u64;
+                    remainder = (wide % 10) as u64;
+                }
+                digits.push(b'0' + remainder as u8);
+                while limbs.last() == Some(&0) {
+                    limbs.pop();
+                }
+            }
+            digits.reverse();
+            String::from_utf8(digits).expect("ASCII decimal digits")
+        }
+    }
+
+    fn parse_oid(content: &[u8]) -> Result<Vec<OidArc>, String> {
         if content.is_empty() {
             return Err("empty OID".to_string());
         }
@@ -826,21 +919,23 @@ mod x509 {
         // The first subidentifier encodes the first two arcs as
         // 40*first + second and is itself a base-128 quantity, so it can
         // span multiple content bytes (e.g. 2.999 encodes as 0x88 0x37).
+        // Like every arc it has no machine-width bound: a first pair whose
+        // combined value exceeds 64 bits stays a legal, exact value.
         let mut i = 0;
         let first = read_oid_arc(content, &mut i)?;
-        match first {
-            0..=39 => {
-                arcs.push(0);
-                arcs.push(first);
-            }
-            40..=79 => {
-                arcs.push(1);
-                arcs.push(first - 40);
-            }
-            _ => {
-                arcs.push(2);
-                arcs.push(first - 80);
-            }
+        if first.cmp_u64(39).is_le() {
+            arcs.push(OidArc::zero());
+            arcs.push(first);
+        } else if first.cmp_u64(79).is_le() {
+            let mut second = first;
+            second.sub_u64(40);
+            arcs.push(OidArc::from_u64(1));
+            arcs.push(second);
+        } else {
+            let mut second = first;
+            second.sub_u64(80);
+            arcs.push(OidArc::from_u64(2));
+            arcs.push(second);
         }
         while i < content.len() {
             arcs.push(read_oid_arc(content, &mut i)?);
@@ -848,19 +943,18 @@ mod x509 {
         Ok(arcs)
     }
 
-    /// Read one base-128 subidentifier starting at `*i`. Rejects trailing
-    /// continuation bytes and non-minimal encodings.
-    fn read_oid_arc(content: &[u8], i: &mut usize) -> Result<u64, String> {
+    /// Read one base-128 subidentifier starting at `*i`. The value is kept
+    /// exactly at arbitrary precision (see `OidArc`). Rejects a missing
+    /// terminating byte ("truncated OID arc") and non-minimal encodings
+    /// (extra leading zero groups, e.g. 0x80 0x01 for the value 1).
+    fn read_oid_arc(content: &[u8], i: &mut usize) -> Result<OidArc, String> {
         let start = *i;
-        let mut value = 0u64;
+        let mut value = OidArc::zero();
         loop {
             let b = *content
                 .get(*i)
                 .ok_or_else(|| "truncated OID arc".to_string())?;
-            value = value
-                .checked_mul(128)
-                .and_then(|v| v.checked_add((b & 0x7F) as u64))
-                .ok_or_else(|| "OID arc overflow".to_string())?;
+            value.mul_128_add((b & 0x7F) as u64);
             *i += 1;
             if b & 0x80 == 0 {
                 break;
@@ -872,38 +966,75 @@ mod x509 {
         Ok(value)
     }
 
-    fn arcs_to_string(arcs: &[u64]) -> String {
+    fn arcs_to_string(arcs: &[OidArc]) -> String {
         arcs.iter()
-            .map(u64::to_string)
+            .map(OidArc::to_decimal)
             .collect::<Vec<_>>()
             .join(".")
     }
 
-    fn oid_short_name(arcs: &[u64]) -> Option<&'static str> {
-        // X.520 / X.521 (2.5.4.*) and the commonly used LDAP/PKCS names.
-        let name = match arcs {
-            [2, 5, 4, 3] => "CN",
-            [2, 5, 4, 4] => "SN",
-            [2, 5, 4, 5] => "serialNumber",
-            [2, 5, 4, 6] => "C",
-            [2, 5, 4, 7] => "L",
-            [2, 5, 4, 8] => "ST",
-            [2, 5, 4, 9] => "STREET",
-            [2, 5, 4, 10] => "O",
-            [2, 5, 4, 11] => "OU",
-            [2, 5, 4, 12] => "title",
-            [2, 5, 4, 17] => "postalAddress",
-            [2, 5, 4, 18] => "postalCode",
-            [2, 5, 4, 20] => "telephoneNumber",
-            [2, 5, 4, 42] => "givenName",
-            [2, 5, 4, 43] => "initials",
-            [2, 5, 4, 44] => "generationQualifier",
-            [2, 5, 4, 46] => "dnQualifier",
-            [2, 5, 4, 65] => "pseudonym",
-            [0, 9, 2342, 19200300, 100, 1, 1] => "UID",
-            [0, 9, 2342, 19200300, 100, 1, 25] => "DC",
-            [1, 2, 840, 113549, 1, 9, 1] => "emailAddress",
-            _ => return None,
+    fn oid_short_name(arcs: &[OidArc]) -> Option<&'static str> {
+        // X.520 / X.521 (2.5.4.*) and the commonly used LDAP/PKCS names. Only
+        // the fixed-size tables of small, recognized arcs are matched; an OID
+        // with an oversized arc simply has no short name.
+        fn u(arcs: &[OidArc], pos: usize) -> Option<u64> {
+            arcs.get(pos).and_then(|a| match a.limbs.as_slice() {
+                [v] => Some(*v),
+                [] => Some(0),
+                _ => None,
+            })
+        }
+        let small = |table: &[u64]| -> bool {
+            arcs.len() == table.len()
+                && table
+                    .iter()
+                    .enumerate()
+                    .all(|(pos, &want)| u(arcs, pos) == Some(want))
+        };
+        let name = if small(&[2, 5, 4, 3]) {
+            "CN"
+        } else if small(&[2, 5, 4, 4]) {
+            "SN"
+        } else if small(&[2, 5, 4, 5]) {
+            "serialNumber"
+        } else if small(&[2, 5, 4, 6]) {
+            "C"
+        } else if small(&[2, 5, 4, 7]) {
+            "L"
+        } else if small(&[2, 5, 4, 8]) {
+            "ST"
+        } else if small(&[2, 5, 4, 9]) {
+            "STREET"
+        } else if small(&[2, 5, 4, 10]) {
+            "O"
+        } else if small(&[2, 5, 4, 11]) {
+            "OU"
+        } else if small(&[2, 5, 4, 12]) {
+            "title"
+        } else if small(&[2, 5, 4, 17]) {
+            "postalAddress"
+        } else if small(&[2, 5, 4, 18]) {
+            "postalCode"
+        } else if small(&[2, 5, 4, 20]) {
+            "telephoneNumber"
+        } else if small(&[2, 5, 4, 42]) {
+            "givenName"
+        } else if small(&[2, 5, 4, 43]) {
+            "initials"
+        } else if small(&[2, 5, 4, 44]) {
+            "generationQualifier"
+        } else if small(&[2, 5, 4, 46]) {
+            "dnQualifier"
+        } else if small(&[2, 5, 4, 65]) {
+            "pseudonym"
+        } else if small(&[0, 9, 2342, 19200300, 100, 1, 1]) {
+            "UID"
+        } else if small(&[0, 9, 2342, 19200300, 100, 1, 25]) {
+            "DC"
+        } else if small(&[1, 2, 840, 113549, 1, 9, 1]) {
+            "emailAddress"
+        } else {
+            return None;
         };
         Some(name)
     }

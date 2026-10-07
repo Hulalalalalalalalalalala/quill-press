@@ -460,6 +460,52 @@ fn different_extension_oids_with_identical_body_and_critical_are_accepted() {
     assert_success(&run_inspect("distinct-oid-same-body", &cert));
 }
 
+// ----- Arcs wider than any machine integer ---------------------------------
+//
+// Extension OID identity and legality never depend on a machine integer
+// width: an arc past u64::MAX must parse, and the complete dotted-decimal
+// value (not a truncation) decides duplicates. Raw OID content bytes are used
+// because the test DER builder works in u64. 2^64 encodes shortest-form as
+// 82 80 80 80 80 80 80 80 80 00. Both OIDs below start 2.5.29 (first pair 85,
+// then 29), then a 2^64 arc, then 1 or 2.
+
+/// 2.5.29.18446744073709551616.1
+const BIG_EXT_OID_1: &[u8] = &[
+    0x55, 0x1D, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01,
+];
+/// 2.5.29.18446744073709551616.2 — differs from the above only in the final
+/// digit, after the same oversized arc.
+const BIG_EXT_OID_2: &[u8] = &[
+    0x55, 0x1D, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x02,
+];
+
+#[test]
+fn duplicate_big_arc_extension_oid_is_rejected_with_full_dotted_form() {
+    // The same big-arced OID twice, even with different values and critical
+    // flags, is a duplicate: identity is the complete OID and the reason must
+    // print the exact 2^64 arc rather than a truncated or wrapped value.
+    let first = extension_raw_oid(BIG_EXT_OID_1, None, b"A");
+    let second = extension_raw_oid(BIG_EXT_OID_1, Some(true), b"other");
+    let items = concat(&[&first, &second]);
+    let cert = build_cert(Some(2), &extensions_field(&items));
+    assert_duplicate_oid(
+        &run_inspect("dup-oid-big-arc", &cert),
+        "2.5.29.18446744073709551616.1",
+    );
+}
+
+#[test]
+fn big_arc_oids_differing_only_in_last_digit_are_not_duplicates() {
+    // Two huge OIDs that agree on the 2^64 arc but differ in the very last
+    // digit are distinct complete OIDs; with identical bodies they must still
+    // coexist rather than collapse into a false duplicate.
+    let a = extension_raw_oid(BIG_EXT_OID_1, Some(true), b"same");
+    let b = extension_raw_oid(BIG_EXT_OID_2, Some(true), b"same");
+    let items = concat(&[&a, &b]);
+    let cert = build_cert(Some(2), &extensions_field(&items));
+    assert_success(&run_inspect("distinct-big-arc-oid", &cert));
+}
+
 #[test]
 fn no_extensions_and_single_extension_remain_accepted() {
     // Zero extensions (no field at all) and one extension never collide.
@@ -618,6 +664,17 @@ fn extensions_field(extension_items: &[u8]) -> Vec<u8> {
 /// extnValue OCTET STRING }.
 fn extension(arcs: &[u64], critical: Option<bool>, value: &[u8]) -> Vec<u8> {
     let mut content = oid(arcs);
+    if let Some(flag) = critical {
+        content.extend_from_slice(&tlv(0x01, &[if flag { 0xFF } else { 0x00 }]));
+    }
+    content.extend_from_slice(&tlv(0x04, value));
+    tlv(0x30, &content)
+}
+
+/// Like `extension`, but the extnID is given as raw OID content bytes so arcs
+/// wider than `u64` can be exercised.
+fn extension_raw_oid(oid_content: &[u8], critical: Option<bool>, value: &[u8]) -> Vec<u8> {
+    let mut content = tlv(0x06, oid_content);
     if let Some(flag) = critical {
         content.extend_from_slice(&tlv(0x01, &[if flag { 0xFF } else { 0x00 }]));
     }

@@ -99,6 +99,56 @@ fn unknown_but_decodable_algorithm_oid_is_accepted() {
     assert_success(&out);
 }
 
+// ----- Arcs wider than any machine integer ---------------------------------
+//
+// A legal OID arc is an arbitrarily large base-128 integer, so an arc past
+// u64::MAX must not be rejected with "OID arc overflow" in either signature
+// algorithm copy. Raw OID content bytes are used because the test DER builder
+// works in u64. 2^64 encodes shortest-form as
+// 82 80 80 80 80 80 80 80 80 00.
+
+/// OID 1.2.18446744073709551616.7 content: first pair 42, then arc 2^64, 7.
+const BIG_SIG_OID_CONTENT: &[u8] = &[
+    0x2A, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x07,
+];
+
+/// OID 1.2.18446744073709551616.8: same huge arc, differing only in the last
+/// digit (0x08 instead of 0x07).
+const BIG_SIG_OID_CONTENT_8: &[u8] = &[
+    0x2A, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x08,
+];
+
+#[test]
+fn signature_algorithm_oid_with_beyond_u64_arc_is_accepted() {
+    // The same legal big OID in both copies (and an explicit NULL parameter
+    // in both) must parse and compare equal purely on its DER bytes.
+    let alg = alg_with_oid_raw(BIG_SIG_OID_CONTENT, Some(&tlv(0x05, &[])));
+    let (out, _cert) = run_inspect("big-arc-match-null", &build_cert(&alg, &alg));
+    assert_success(&out);
+
+    // Parameters absent in both copies is equally fine.
+    let alg = alg_with_oid_raw(BIG_SIG_OID_CONTENT, None);
+    let (out, _cert) = run_inspect("big-arc-match-absent", &build_cert(&alg, &alg));
+    assert_success(&out);
+}
+
+#[test]
+fn big_arc_signature_oids_differing_in_last_digit_still_mismatch() {
+    // Two well-formed huge OIDs that differ only in the final digit are not
+    // the same algorithm: the byte-level comparison already distinguishes
+    // them, and the reason renders both complete dotted-decimal OIDs.
+    let outer = alg_with_oid_raw(BIG_SIG_OID_CONTENT, Some(&tlv(0x05, &[])));
+    let inner = alg_with_oid_raw(BIG_SIG_OID_CONTENT_8, Some(&tlv(0x05, &[])));
+    let (out, _cert) = run_inspect("big-arc-mismatch", &build_cert(&outer, &inner));
+    assert_invalid_at(&out, "mismatch");
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("1.2.18446744073709551616.7")
+            && stderr.contains("1.2.18446744073709551616.8"),
+        "mismatch reason must name both full big OIDs: {stderr}"
+    );
+}
+
 #[test]
 fn signature_oid_may_differ_from_subject_public_key_oid() {
     // The comparison is only between the certificate's own two signature
@@ -440,6 +490,16 @@ fn alg_with_null_params(arcs: &[u64]) -> Vec<u8> {
 
 fn alg_with(arcs: &[u64], params: &[u8]) -> Vec<u8> {
     seq(&concat(&[&oid(arcs), params]))
+}
+
+/// AlgorithmIdentifier whose OID content bytes are supplied directly (needed
+/// for arcs wider than `u64`), followed by `params` if any.
+fn alg_with_oid_raw(oid_content: &[u8], params: Option<&[u8]>) -> Vec<u8> {
+    let oid_tlv = tlv(0x06, oid_content);
+    match params {
+        Some(params) => seq(&concat(&[&oid_tlv, params])),
+        None => seq(&oid_tlv),
+    }
 }
 
 fn bit_string(content: &[u8]) -> Vec<u8> {
