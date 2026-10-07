@@ -131,6 +131,7 @@ mod x509 {
     const TAG_GENERALIZED_TIME: u8 = 0x18;
     const TAG_UTF8_STRING: u8 = 0x0C;
     const TAG_PRINTABLE_STRING: u8 = 0x13;
+    const TAG_IA5_STRING: u8 = 0x16;
     const TAG_UNIVERSAL_STRING: u8 = 0x1C;
     const TAG_BMP_STRING: u8 = 0x1E;
 
@@ -756,7 +757,8 @@ mod x509 {
                 // here, before any display decision and regardless of whether
                 // the attribute later renders as text for a known short name
                 // or as '#'-hex for an unknown type: a UTF8String must hold
-                // valid UTF-8, a PrintableString must keep to its alphabet, a
+                // valid UTF-8, a PrintableString must keep to its alphabet,
+                // an IA5String must keep every byte in 0x00..=0x7F, a
                 // BMPString must hold whole 16-bit non-surrogate characters
                 // and a UniversalString must hold whole, in-range Unicode
                 // code points. The hex form must never let an illegal byte or
@@ -1136,18 +1138,30 @@ mod x509 {
         Ok(s)
     }
 
+    /// Whether every byte is an IA5String byte, i.e. a 7-bit ASCII byte in
+    /// 0x00..=0x7F. The whole range is legal — ordinary ASCII punctuation and
+    /// digits, the control characters (including NUL, tab, newline and DEL) —
+    /// so this is a pure high-bit check, not a printable-character check; a
+    /// byte in 0x80..=0xFF is illegal even when it would combine with its
+    /// neighbours into valid UTF-8 text. An empty value passes, preserving the
+    /// existing acceptance of empty contents.
+    fn is_ia5_string(content: &[u8]) -> bool {
+        content.iter().all(|&b| b < 0x80)
+    }
+
     /// Validate one name attribute value against the rules of its own string
     /// type and, when it is a supported string type, decode it to UTF-8 text.
     ///
     /// This is the single place that owns each supported string type's rules
-    /// (valid UTF-8, the PrintableString alphabet, whole BMP characters
-    /// without surrogates, whole in-range UniversalString code points) and the
-    /// single place that decodes them, so the legality check and the text
-    /// decoding can never drift apart. It runs once per attribute, before any
-    /// display decision and regardless of whether the attribute later renders
-    /// as text for a known short name or as '#'-hex for an unknown type:
-    /// showing a value as hex must never let an illegal byte or code point
-    /// through, and illegal content cannot be dropped or replaced.
+    /// (valid UTF-8, the PrintableString alphabet, the IA5String 0x00..=0x7F
+    /// byte range, whole BMP characters without surrogates, whole in-range
+    /// UniversalString code points) and the single place that decodes them, so
+    /// the legality check and the text decoding can never drift apart. It runs
+    /// once per attribute, before any display decision and regardless of
+    /// whether the attribute later renders as text for a known short name or
+    /// as '#'-hex for an unknown type: showing a value as hex must never let an
+    /// illegal byte or code point through, and illegal content cannot be
+    /// dropped or replaced.
     ///
     /// Returns `Ok(Some(text))` for a supported, valid string type, and
     /// `Ok(None)` for any other tag (a legal DER value with no text decoder —
@@ -1172,10 +1186,25 @@ mod x509 {
                 // its Unicode code point.
                 content.iter().map(|&b| b as char).collect()
             }
-            // NumericString (0x12), IA5String (0x16) and VisibleString (0x1A)
-            // are ASCII-family strings: every byte is also its Unicode code
-            // point and they carry no extra character rule here.
-            0x12 | 0x16 | 0x1A => content.iter().map(|&b| b as char).collect(),
+            // NumericString (0x12) and VisibleString (0x1A) are ASCII-family
+            // strings: every byte is also its Unicode code point and they
+            // carry no extra character rule here.
+            0x12 | 0x1A => content.iter().map(|&b| b as char).collect(),
+            // IA5String (0x16) is a 7-bit ASCII string: each byte must lie in
+            // 0x00..=0x7F; any byte 0x80..=0xFF is illegal, alone or as part
+            // of otherwise valid UTF-8. The full 0x00..=0x7F range stays
+            // legal (punctuation, tab, newline and NUL included); after the
+            // range check every byte is also its Unicode code point.
+            TAG_IA5_STRING => {
+                if !is_ia5_string(content) {
+                    return Err(format!(
+                        "{what} name: IA5String attribute value contains a byte outside the \
+                         IA5 (ASCII) range 0x00..=0x7F (an IA5String cannot carry bytes 0x80..=0xFF, \
+                         even when they form part of valid UTF-8 text)"
+                    ));
+                }
+                content.iter().map(|&b| b as char).collect()
+            }
             // T.61/TeletexString (0x14) and GeneralString (0x1B) are
             // conventionally treated as Latin-1 here: the byte value is the
             // code point and they carry no extra character rule here.

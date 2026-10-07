@@ -415,6 +415,143 @@ fn non_ascii_and_at_still_display_in_utf8_string() {
     assert_success(&out, "CN=user@示例.test", "CN=Test CA");
 }
 
+// ----- IA5String (tag 0x16) byte range rules --------------------------------
+
+#[test]
+fn ia5_string_with_legal_ascii_bytes_displays_as_text() {
+    // IA5String is 7-bit ASCII: ordinary ASCII letters, digits and punctuation
+    // (including symbols PrintableString rejects such as '@', '_', '#' and
+    // '!') display verbatim, with only the usual RFC 4514 escaping of ',' and
+    // edge spaces.
+    let subject = name(&[rdn(&[atv_ia5(CN, b"a@b_c#d!e,f ")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-legal-punct", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=a@b_c#d!e\\,f\\ ", "CN=Test CA");
+}
+
+#[test]
+fn ia5_string_accepts_control_bytes_with_existing_escaping() {
+    // The legal range is the whole 0x00..=0x7F, not only printable
+    // characters: NUL, tab, newline and DEL are all legal and keep the
+    // existing control-character escaping; no extra output lines are added.
+    let subject = name(&[rdn(&[atv_ia5(CN, b"a\tb\nc\0d\x7F")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-controls", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=a\\09b\\0Ac\\00d\\7F", "CN=Test CA");
+}
+
+#[test]
+fn ia5_string_for_unknown_oid_still_uses_full_der_hex() {
+    // A legal IA5String at an unknown OID is still shown by encoding (never
+    // decoded to text): tag 0x16, length and content in uppercase hex.
+    let subject = name(&[rdn(&[atv_ia5(&[1, 2, 3, 4], b"abc")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-unknown", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "1.2.3.4=#1603616263", "CN=Test CA");
+}
+
+#[test]
+fn empty_ia5_string_is_accepted_for_known_and_unknown_attributes() {
+    // Empty content keeps the pre-existing acceptance: a known attribute shows
+    // an empty value, an unknown one keeps the tag-and-length encoding.
+    let subject = name(&[
+        rdn(&[atv_ia5(CN, b"")]),
+        rdn(&[atv_ia5(&[1, 2, 3, 4], b"")]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-empty", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "1.2.3.4=#1600,CN=", "CN=Test CA");
+}
+
+#[test]
+fn non_ascii_bytes_in_subject_ia5_string_are_rejected() {
+    // One byte in 0x80..=0xFF anywhere in an IA5String fails the whole
+    // certificate. The high bit is the only line: isolated corrupt bytes are
+    // rejected, and so are byte sequences that happen to be valid UTF-8
+    // (U+00A9 "(c)" and U+4E2D CJK) — legality follows the value's IA5String
+    // type, never any inferred text decoding.
+    let cases: &[&[u8]] = &[
+        b"a\x80b",
+        b"a\xA9b",
+        b"a\xC3b",
+        b"a\xFFb",
+        b"\xA9",
+        "a中b".as_bytes(), // E4 B8 AD: legal UTF-8, illegal IA5
+        "示".as_bytes(),
+    ];
+    for value in cases {
+        let subject = name(&[rdn(&[atv_ia5(CN, value)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("ia5-bad-subject", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        let stderr = lossy(&out.stderr);
+        assert!(
+            stderr.contains("subject") && stderr.contains("IA5String"),
+            "value {value:02X?} must fail as a subject IA5String error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn non_ascii_byte_in_issuer_ia5_string_is_rejected_and_named() {
+    // The same rule applies to the Issuer name, and the reason names it.
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv_ia5(CN, b"ca\xff")])]);
+    let (out, _cert) = run_inspect("ia5-bad-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("IA5String"),
+        "reason must name the issuer name and IA5String: {stderr}"
+    );
+}
+
+#[test]
+fn illegal_ia5_string_at_unknown_oid_cannot_be_accepted_via_hex() {
+    // Unknown attributes render as '#'-hex, but hex display is not an escape
+    // hatch: an IA5String containing a 0x80 byte must fail even though the
+    // value would otherwise appear only as hex.
+    let subject = name(&[rdn(&[atv_ia5(&[1, 2, 3, 4], &[0x61, 0x80, 0x62])])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-bad-unknown", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("IA5String"));
+}
+
+#[test]
+fn illegal_ia5_value_between_legal_attributes_is_not_ignored() {
+    // A corrupt IA5String surrounded by other, legal RDNs still rejects the
+    // whole name; the good attributes cannot mask it and nothing is printed.
+    let subject = name(&[
+        rdn(&[atv_utf8(C, "US")]),
+        rdn(&[atv_ia5(CN, &[b'a', 0xE4, b'b'])]),
+        rdn(&[atv_utf8(O, "Org")]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-bad-interleaved", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("IA5String"));
+}
+
+#[test]
+fn same_high_bytes_remain_legal_inside_utf8_string() {
+    // The companion contrast: the exact bytes rejected in an IA5String are
+    // perfectly legal in a UTF8String, which keeps displaying them verbatim.
+    let subject = name(&[rdn(&[atv_utf8(CN, "中©")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-utf8-unaffected", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "CN=中©", "CN=Test CA");
+}
+
 // ----- BMPString (tag 0x1E) character rules --------------------------------
 
 #[test]
@@ -1180,6 +1317,10 @@ fn atv_utf8(arcs: &[u64], text: &str) -> Vec<u8> {
 
 fn atv_printable(arcs: &[u64], bytes: &[u8]) -> Vec<u8> {
     atv(arcs, &tlv(0x13, bytes))
+}
+
+fn atv_ia5(arcs: &[u64], bytes: &[u8]) -> Vec<u8> {
+    atv(arcs, &tlv(0x16, bytes))
 }
 
 fn atv_bmp(arcs: &[u64], content: &[u8]) -> Vec<u8> {
