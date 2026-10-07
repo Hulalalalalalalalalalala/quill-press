@@ -415,6 +415,225 @@ fn non_ascii_and_at_still_display_in_utf8_string() {
     assert_success(&out, "CN=user@示例.test", "CN=Test CA");
 }
 
+// ----- IA5String (tag 0x16) ASCII byte-range rules --------------------------
+
+#[test]
+fn ia5_string_with_legal_bytes_displays_as_text() {
+    // IA5String is ASN.1's ASCII type: the whole 0x00..=0x7F range is legal,
+    // not just printable characters. Ordinary ASCII symbols that a
+    // PrintableString would reject ('@', '_', '#') pass, and so do NUL, tab,
+    // LF and DEL — the existing RFC 4514 control-character escaping applies to
+    // them (\00, \09, \0A, \7F), adding no extra output line. Leading tab and
+    // the trailing NUL are control characters, not spaces, so they take the
+    // hex escape rather than the edge-space rule; embedded spaces and commas
+    // keep their existing escaping and are otherwise untouched.
+    let subject = name(&[rdn(&[atv_ia5(
+        CN,
+        b"\tJohn\nDoe, Jr.@_\x7F#1\x00",
+    )])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-legal", &build_cert(&subject, &issuer));
+
+    assert_success(
+        &out,
+        "CN=\\09John\\0ADoe\\, Jr.@_\\7F#1\\00",
+        "CN=Test CA",
+    );
+}
+
+#[test]
+fn ia5_string_accepts_every_control_byte_and_del() {
+    // No legal byte of 0x00..=0x7F may be rejected: probe the control ranges
+    // (0x00..=0x1F and 0x7F) one by one; each renders through the existing
+    // two-digit control escape without failing.
+    for legal in (0x00u8..=0x1F).chain([0x7F]) {
+        let subject = name(&[rdn(&[atv_ia5(CN, &[b'a', legal, b'b'])])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("ia5-legal-controls", &build_cert(&subject, &issuer));
+
+        assert_eq!(out.status.code(), Some(0), "stderr={}", lossy(&out.stderr));
+        assert_eq!(
+            lossy(&out.stdout).lines().next().unwrap(),
+            &format!("Subject: CN=a\\{legal:02X}b"),
+            "byte 0x{legal:02X} must stay legal in an IA5String"
+        );
+    }
+}
+
+#[test]
+fn ia5_string_for_unknown_oid_still_uses_full_der_hex() {
+    // A legal IA5String at an unknown OID is shown by encoding (never decoded
+    // to text): tag 0x16, length and content in uppercase hex.
+    let subject = name(&[rdn(&[atv_ia5(&[1, 2, 3, 4], b"abc")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-unknown", &build_cert(&subject, &issuer));
+
+    assert_success(&out, "1.2.3.4=#1603616263", "CN=Test CA");
+}
+
+#[test]
+fn empty_ia5_string_is_accepted_in_both_display_forms() {
+    // Empty content keeps the pre-existing acceptance: a known attribute shows
+    // empty text, an unknown attribute shows tag and zero length as #1600.
+    let issuer = simple_cn_name("Test CA");
+
+    let subject = name(&[rdn(&[atv_ia5(CN, b"")])]);
+    let (out, _cert) = run_inspect("ia5-empty-known", &build_cert(&subject, &issuer));
+    assert_success(&out, "CN=", "CN=Test CA");
+
+    let subject = name(&[rdn(&[atv_ia5(&[1, 2, 3, 4], b"")])]);
+    let (out, _cert) = run_inspect("ia5-empty-unknown", &build_cert(&subject, &issuer));
+    assert_success(&out, "1.2.3.4=#1600", "CN=Test CA");
+}
+
+#[test]
+fn non_ascii_bytes_in_subject_ia5_string_are_rejected() {
+    // Any byte in 0x80..=0xFF fails the whole certificate wherever it stands:
+    // alone, after a legal DEL, embedded between ASCII bytes, and even when the
+    // surrounding bytes are perfectly valid UTF-8 (the two-byte UTF-8 of 'é'
+    // and the three-byte UTF-8 of '例'). The IA5String byte range is what
+    // counts; the bytes are never printed, replaced or reinterpreted as
+    // UTF-8.
+    for bad in [
+        vec![0x80],
+        vec![0xFF],
+        vec![0x7F, 0x80],
+        vec![b'a', 0xA9, b'b'],
+        vec![b'a', 0xC2, 0xA9, b'b'], // valid UTF-8 'é' between ASCII
+        vec![0xE4, 0xBE, 0x8B],       // valid UTF-8 '例'
+        vec![b'x', 0xC3, 0xBF],       // valid UTF-8 'ÿ' after ASCII
+    ] {
+        let subject = name(&[rdn(&[atv_ia5(CN, &bad)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("ia5-bad-subject", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        let stderr = lossy(&out.stderr);
+        assert!(
+            stderr.contains("subject") && stderr.contains("IA5String"),
+            "{bad:02X?} must fail as a subject IA5String error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn non_ascii_byte_in_issuer_ia5_string_is_rejected_and_named() {
+    // The same rule independently governs the Issuer name, and the reason
+    // names it — even though the subject is well formed.
+    let subject = simple_cn_name("subject.example");
+    let issuer = name(&[rdn(&[atv_ia5(CN, b"bad\xCAca")])]);
+    let (out, _cert) = run_inspect("ia5-bad-issuer", &build_cert(&subject, &issuer));
+
+    assert_invalid_certificate(&out);
+    let stderr = lossy(&out.stderr);
+    assert!(
+        stderr.contains("issuer") && stderr.contains("IA5String"),
+        "reason must name the issuer name and IA5String: {stderr}"
+    );
+}
+
+#[test]
+fn illegal_ia5_string_at_unknown_oid_cannot_be_accepted_via_hex() {
+    // Unknown attributes render as '#'-hex, but hex display is not an escape
+    // hatch: an IA5String carrying 0x80..=0xFF must fail even though the value
+    // would otherwise appear only as hex bytes, and even when those bytes form
+    // valid UTF-8.
+    for bad in [
+        vec![b'a', 0x80, b'b'],
+        vec![0xE4, 0xBE, 0x8B], // valid UTF-8 '例'
+    ] {
+        let subject = name(&[rdn(&[atv_ia5(&[1, 2, 3, 4], &bad)])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("ia5-bad-unknown", &build_cert(&subject, &issuer));
+
+        assert_invalid_certificate(&out);
+        assert!(lossy(&out.stderr).contains("IA5String"));
+    }
+}
+
+#[test]
+fn illegal_ia5_string_between_legal_attributes_is_rejected() {
+    // One bad IA5String value must not be ignored because legal attributes
+    // stand on both sides of it — neither in its own RDN between two other
+    // RDNs, nor as a member inside an otherwise legal multi-valued RDN.
+    let subject = name(&[
+        rdn(&[atv_utf8(C, "US")]),
+        rdn(&[atv_ia5(CN, b"bad\xffca")]),
+        rdn(&[atv_utf8(O, "org")]),
+    ]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-bad-among-rdns", &build_cert(&subject, &issuer));
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("subject"));
+    assert!(lossy(&out.stderr).contains("IA5String"));
+
+    // Multi-valued RDN: the unknown IA5 member's complete encoding is longer
+    // than the CN UTF8String member, so it sorts second and the SET OF order
+    // is legal; the illegal byte still rejects.
+    let subject = name(&[rdn(&[
+        atv_utf8(CN, "ok"),
+        atv_ia5(&[1, 2, 3, 4], b"bad\xff"),
+    ])]);
+    let (out, _cert) = run_inspect("ia5-bad-among-members", &build_cert(&subject, &issuer));
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("IA5String"));
+}
+
+#[test]
+fn ia5_rule_depends_on_the_carried_type_not_the_attribute_name() {
+    // A known short name cannot relax the rule: DC (2nd most common IA5
+    // carrier after CN in real certificates) with bytes forming valid UTF-8
+    // ('é') is still corrupt under an IA5String tag.
+    let dc = &[0, 9, 2342, 19200300, 100, 1, 25];
+    let subject = name(&[rdn(&[atv_ia5(dc, b"caf\xC3\xA9")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-bad-dc", &build_cert(&subject, &issuer));
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("IA5String"));
+
+    // The same DC carrying plain ASCII keeps displaying as text.
+    let subject = name(&[rdn(&[atv_ia5(dc, b"example.com")])]);
+    let (out, _cert) = run_inspect("ia5-legal-dc", &build_cert(&subject, &issuer));
+    assert_success(&out, "DC=example.com", "CN=Test CA");
+}
+
+#[test]
+fn same_bytes_are_legal_utf8_but_illegal_ia5() {
+    // The bytes E4 BE 8B mean '例' in a UTF8String (accepted, shown as text)
+    // but are three illegal bytes in an IA5String (rejected): the decision is
+    // made from the value's actual tag, never from the content looking like
+    // text.
+    let cjk = [0xE4u8, 0xBE, 0x8B];
+
+    let subject = name(&[rdn(&[atv_utf8(CN, "例")])]);
+    let issuer = simple_cn_name("Test CA");
+    let (out, _cert) = run_inspect("ia5-vs-utf8-utf8", &build_cert(&subject, &issuer));
+    assert_success(&out, "CN=例", "CN=Test CA");
+
+    let subject = name(&[rdn(&[atv_ia5(CN, &cjk)])]);
+    let (out, _cert) = run_inspect("ia5-vs-utf8-ia5", &build_cert(&subject, &issuer));
+    assert_invalid_certificate(&out);
+    assert!(lossy(&out.stderr).contains("IA5String"));
+}
+
+#[test]
+fn other_ascii_family_string_tags_keep_their_existing_behavior() {
+    // The new range rule belongs to IA5String (0x16) alone. NumericString
+    // (0x12) and VisibleString (0x1A) keep their pre-existing byte passthrough
+    // for a non-ASCII byte instead of being tightened alongside it.
+    for tag in [0x12u8, 0x1A] {
+        let subject = name(&[rdn(&[atv(CN, &tlv(tag, &[b'A', 0xE9]))])]);
+        let issuer = simple_cn_name("Test CA");
+        let (out, _cert) = run_inspect("ia5-other-tags", &build_cert(&subject, &issuer));
+        assert_eq!(out.status.code(), Some(0), "stderr={}", lossy(&out.stderr));
+        assert_eq!(
+            lossy(&out.stdout).lines().next().unwrap(),
+            "Subject: CN=Aé",
+            "tag 0x{tag:02X} must keep its existing passthrough behavior"
+        );
+    }
+}
+
 // ----- BMPString (tag 0x1E) character rules --------------------------------
 
 #[test]
@@ -1180,6 +1399,10 @@ fn atv_utf8(arcs: &[u64], text: &str) -> Vec<u8> {
 
 fn atv_printable(arcs: &[u64], bytes: &[u8]) -> Vec<u8> {
     atv(arcs, &tlv(0x13, bytes))
+}
+
+fn atv_ia5(arcs: &[u64], bytes: &[u8]) -> Vec<u8> {
+    atv(arcs, &tlv(0x16, bytes))
 }
 
 fn atv_bmp(arcs: &[u64], content: &[u8]) -> Vec<u8> {
